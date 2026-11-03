@@ -1,0 +1,293 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Media Compressor</title>
+  <link rel="stylesheet" href="/src/styles.css" />
+</head>
+<body>
+  <!-- SVG icon sprite -->
+  <svg width="0" height="0" style="position:absolute">
+    <defs>
+      <symbol id="i-gear" viewBox="0 0 24 24"><path fill="currentColor" d="M19.4 13a7.6 7.6 0 0 0 0-2l2.1-1.6-2-3.5-2.5 1a7.4 7.4 0 0 0-1.7-1L15 3.3h-4l-.4 2.6a7.4 7.4 0 0 0-1.7 1l-2.5-1-2 3.5L6.6 11a7.6 7.6 0 0 0 0 2l-2.1 1.6 2 3.5 2.5-1a7.4 7.4 0 0 0 1.7 1l.4 2.6h4l.4-2.6a7.4 7.4 0 0 0 1.7-1l2.5 1 2-3.5zM13 15.5A3.5 3.5 0 1 1 13 8.5a3.5 3.5 0 0 1 0 7z" transform="translate(-1 0)"/></symbol>
+      <symbol id="i-play" viewBox="0 0 24 24"><path fill="currentColor" d="M8 5.5v13l10.5-6.5z"/></symbol>
+      <symbol id="i-pause" viewBox="0 0 24 24"><path fill="currentColor" d="M7 5h3.5v14H7zm6.5 0H17v14h-3.5z"/></symbol>
+      <symbol id="i-start" viewBox="0 0 24 24"><path fill="currentColor" d="M6 5h2.2v14H6zm3.5 7L18 5.5v13z"/></symbol>
+      <symbol id="i-end" viewBox="0 0 24 24"><path fill="currentColor" d="M15.8 5H18v14h-2.2zM14.5 12 6 18.5v-13z"/></symbol>
+      <symbol id="i-prev" viewBox="0 0 24 24"><path fill="currentColor" d="M15.5 5.5v13L7 12z"/></symbol>
+      <symbol id="i-next" viewBox="0 0 24 24"><path fill="currentColor" d="M8.5 5.5v13L17 12z"/></symbol>
+      <symbol id="i-cutin" viewBox="0 0 24 24"><path fill="currentColor" d="M6 4h7v2.5H8.5v11H13V20H6z"/><path fill="currentColor" d="M14 9.5v5l4-2.5z"/></symbol>
+      <symbol id="i-cutout" viewBox="0 0 24 24"><path fill="currentColor" d="M18 4h-7v2.5h4.5v11H11V20h7z"/><path fill="currentColor" d="M10 9.5v5L6 12z"/></symbol>
+      <symbol id="i-tocut-in" viewBox="0 0 24 24"><path fill="currentColor" d="M5 5h2.2v14H5zm4 7 8-6.5v13z"/><path fill="currentColor" d="M18 5h1.5v14H18z" opacity=".5"/></symbol>
+      <symbol id="i-tocut-out" viewBox="0 0 24 24"><path fill="currentColor" d="M16.8 5H19v14h-2.2zM15 12 7 18.5v-13z"/><path fill="currentColor" d="M4.5 5H6v14H4.5z" opacity=".5"/></symbol>
+      <symbol id="i-vol" viewBox="0 0 24 24"><path fill="currentColor" d="M4 9h4l5-4v14l-5-4H4zm12.5 3a4.5 4.5 0 0 0-2-3.7v7.4a4.5 4.5 0 0 0 2-3.7zm-2-8v2.1a7 7 0 0 1 0 11.8V20a9 9 0 0 0 0-16z"/></symbol>
+      <symbol id="i-mute" viewBox="0 0 24 24"><path fill="currentColor" d="M4 9h4l5-4v14l-5-4H4zm11.6.4 1.4-1.4 2.1 2.1 2.1-2.1 1.4 1.4-2.1 2.1 2.1 2.1-1.4 1.4-2.1-2.1-2.1 2.1-1.4-1.4 2.1-2.1z"/></symbol>
+      <symbol id="i-arrow" viewBox="0 0 24 24"><path fill="currentColor" d="M12.6 5 11.2 6.4l4.6 4.6H4v2h11.8l-4.6 4.6 1.4 1.4 7-7z"/></symbol>
+      <symbol id="i-back" viewBox="0 0 24 24"><path fill="currentColor" d="M11.4 5 12.8 6.4 8.2 11H20v2H8.2l4.6 4.6-1.4 1.4-7-7z"/></symbol>
+      <symbol id="i-folder" viewBox="0 0 24 24"><path fill="currentColor" d="M3 6.5A1.5 1.5 0 0 1 4.5 5H10l2 2h7.5A1.5 1.5 0 0 1 21 8.5v9a1.5 1.5 0 0 1-1.5 1.5h-15A1.5 1.5 0 0 1 3 17.5z"/></symbol>
+      <symbol id="i-scissors" viewBox="0 0 24 24"><path fill="currentColor" d="M9.6 7.6A3.5 3.5 0 1 0 8 9.9L10.2 12 8 14.1a3.5 3.5 0 1 0 1.6 2.3l2.4-2.3 6.6 6.4H22L9.6 7.6zM6.5 8a1.5 1.5 0 1 1 0-3 1.5 1.5 0 0 1 0 3zm0 11a1.5 1.5 0 1 1 0-3 1.5 1.5 0 0 1 0 3zM22 3.5h-3.4l-5 4.8 1.7 1.7z"/></symbol>
+    </defs>
+  </svg>
+
+  <div id="app">
+    <header class="topbar">
+      <div class="topbar-left">
+        <span id="file-title" class="file-title"></span>
+      </div>
+      <div class="topbar-right">
+        <button id="open-btn" class="chip" title="Open a video file (Ctrl+O)">Open file…</button>
+        <button id="settings-btn" class="icon-btn" title="Settings"><svg><use href="#i-gear"/></svg></button>
+      </div>
+    </header>
+
+    <!-- ============ EDITOR / TRIM SCREEN ============ -->
+    <section id="editor" class="screen">
+      <div id="stage">
+        <div id="dropzone" class="dropzone" tabindex="0">
+          <div class="drop-title">DROP FILE</div>
+          <div class="drop-line">or <b>click</b> to browse</div>
+          <div class="drop-line"><kbd>I</kbd> <kbd>O</kbd> to set cutpoints</div>
+          <div class="drop-line"><kbd>Space</kbd> to play / pause</div>
+          <svg class="drop-logo" viewBox="0 0 120 120" aria-hidden="true">
+            <rect x="6" y="6" width="108" height="108" rx="24" fill="#202428"/>
+            <rect x="20" y="80" width="80" height="9" rx="4.5" fill="#3c4248"/>
+            <rect x="39" y="80" width="43" height="9" rx="2" fill="#2ba6be"/>
+            <rect x="37" y="75" width="3.4" height="19" fill="#e67846"/>
+            <rect x="81" y="75" width="3.4" height="19" fill="#e67846"/>
+            <path d="M47 28v37l30-18.5z" fill="#2ba6be"/>
+          </svg>
+        </div>
+        <video id="video" preload="auto" hidden></video>
+        <div id="stage-msg" class="stage-msg" hidden>
+          <div id="stage-msg-text">Loading…</div>
+          <div class="bar"><div id="stage-msg-bar"></div></div>
+        </div>
+      </div>
+
+      <div id="timeline" class="timeline">
+        <canvas id="tl-canvas"></canvas>
+        <div id="tl-time" class="tl-time">00:00:00.000 (0)</div>
+      </div>
+
+      <div class="controls">
+        <button class="ctl" id="btn-start" title="Jump to start of video (Home)"><svg><use href="#i-start"/></svg></button>
+        <span class="dash">-</span>
+        <button class="ctl cut" id="btn-goto-in" title="Jump to cut start"><svg><use href="#i-tocut-in"/></svg></button>
+        <button class="ctl cut" id="btn-set-in" title="Set cut start to current position (I)"><svg><use href="#i-cutin"/></svg></button>
+        <input class="timebox" id="in-time" value="00:00:00.000" spellcheck="false" title="Cut start — type a time and press Enter" />
+        <button class="ctl" id="btn-prev" title="Previous frame (, or Ctrl+←)"><svg><use href="#i-prev"/></svg></button>
+        <button class="play" id="btn-play" title="Play / pause (Space)"><svg id="play-icon"><use href="#i-play"/></svg></button>
+        <button class="ctl" id="btn-next" title="Next frame (. or Ctrl+→)"><svg><use href="#i-next"/></svg></button>
+        <input class="timebox" id="out-time" value="00:00:00.000" spellcheck="false" title="Cut end — type a time and press Enter" />
+        <button class="ctl cut" id="btn-set-out" title="Set cut end to current position (O)"><svg><use href="#i-cutout"/></svg></button>
+        <button class="ctl cut" id="btn-goto-out" title="Jump to cut end"><svg><use href="#i-tocut-out"/></svg></button>
+        <span class="dash">-</span>
+        <button class="ctl" id="btn-end" title="Jump to end of video (End)"><svg><use href="#i-end"/></svg></button>
+      </div>
+
+      <div class="bottombar">
+        <div class="bb-left">
+          <select id="speed" class="small-select" title="Playback speed">
+            <option value="0.25">0.25x</option><option value="0.5">0.5x</option>
+            <option value="1" selected>1x</option><option value="1.5">1.5x</option>
+            <option value="2">2x</option><option value="4">4x</option>
+          </select>
+          <select id="zoom" class="small-select" title="Timeline zoom (Ctrl + mouse wheel)">
+            <option value="1">Zoom 1x</option><option value="2">Zoom 2x</option>
+            <option value="4">Zoom 4x</option><option value="8">Zoom 8x</option>
+            <option value="16">Zoom 16x</option><option value="32">Zoom 32x</option>
+            <option value="64">Zoom 64x</option>
+          </select>
+          <button class="icon-btn" id="btn-mute" title="Mute (M)"><svg id="vol-icon"><use href="#i-vol"/></svg></button>
+          <span id="cut-info" class="cut-info"></span>
+        </div>
+        <div class="bb-right">
+          <button id="btn-to-config" class="primary" disabled title="Configure and export (Enter)">
+            Next <svg><use href="#i-arrow"/></svg>
+          </button>
+        </div>
+      </div>
+    </section>
+
+    <!-- ============ CONFIG / EXPORT SCREEN ============ -->
+    <section id="config" class="screen" hidden>
+      <div class="config-scroll">
+        <div class="config-wrap">
+          <div class="config-head">
+            <button id="btn-back" class="ghost"><svg><use href="#i-back"/></svg> Back to trim</button>
+            <div>
+              <h1>Export settings</h1>
+              <div id="cfg-summary" class="muted"></div>
+            </div>
+          </div>
+
+          <div class="card">
+            <h2>Output file</h2>
+            <label class="field">
+              <span>File name</span>
+              <div class="row">
+                <input id="cfg-filename" type="text" spellcheck="false" />
+                <button id="btn-reset-name" class="ghost small" title="Rebuild from the filename format in Settings">Reset</button>
+              </div>
+            </label>
+            <div class="hint" id="cfg-folder"></div>
+            <div class="warn" id="cfg-name-warn" hidden></div>
+          </div>
+
+          <div class="card" id="video-card">
+            <h2>Video</h2>
+            <div class="seg" id="mode-seg">
+              <button data-mode="bitrate">Bitrate</button>
+              <button data-mode="size">Target file size</button>
+            </div>
+            <div class="grid2">
+              <label class="field" id="f-bitrate">
+                <span>Video bitrate</span>
+                <div class="suffix"><input id="cfg-bitrate" type="number" min="100" step="100" /><em>kbps</em></div>
+              </label>
+              <label class="field" id="f-size" hidden>
+                <span>Target size</span>
+                <div class="suffix"><input id="cfg-size" type="number" min="1" step="1" /><em>MB</em></div>
+              </label>
+              <label class="field">
+                <span>Resolution</span>
+                <select id="cfg-res"></select>
+              </label>
+              <label class="field">
+                <span>Encoder</span>
+                <select id="cfg-encoder">
+                  <option value="libx264">H.264 (x264, CPU)</option>
+                  <option value="libx265">H.265 / HEVC (x265, CPU)</option>
+                  <option value="h264_nvenc">H.264 (NVIDIA NVENC)</option>
+                  <option value="hevc_nvenc">H.265 (NVIDIA NVENC)</option>
+                </select>
+              </label>
+              <label class="field" id="f-preset">
+                <span>Speed preset</span>
+                <select id="cfg-preset">
+                  <option>ultrafast</option><option>superfast</option><option>veryfast</option>
+                  <option>faster</option><option>fast</option><option>medium</option>
+                  <option>slow</option><option>slower</option><option>veryslow</option>
+                </select>
+              </label>
+            </div>
+            <label class="check" id="f-twopass"><input type="checkbox" id="cfg-twopass" /> Two-pass encoding <span class="muted">(slower, more accurate size &amp; better quality)</span></label>
+            <div class="readout" id="cfg-readout"></div>
+          </div>
+
+          <div class="card" id="audio-card">
+            <h2>Audio tracks</h2>
+            <p class="muted small-text">Tracks set to <b>Master</b> are mixed together into one track. <b>Keep</b> tracks are copied as their own separate tracks. <b>Remove</b> drops them to save space.</p>
+            <div id="audio-list" class="audio-list"></div>
+            <div class="grid2">
+              <label class="field">
+                <span>Audio bitrate (per track)</span>
+                <select id="cfg-abitrate">
+                  <option value="64">64 kbps</option><option value="96">96 kbps</option>
+                  <option value="128">128 kbps</option><option value="160">160 kbps</option>
+                  <option value="192">192 kbps</option><option value="256">256 kbps</option>
+                  <option value="320">320 kbps</option>
+                </select>
+              </label>
+            </div>
+            <div class="readout" id="audio-readout"></div>
+          </div>
+
+          <div class="config-actions">
+            <div id="cfg-error" class="error-text"></div>
+            <button id="btn-export" class="primary big"><svg><use href="#i-scissors"/></svg> Export</button>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ============ SETTINGS MODAL ============ -->
+    <div id="settings-modal" class="modal" hidden>
+      <div class="modal-card">
+        <h1>Settings</h1>
+
+        <h2>Default file name</h2>
+        <label class="field">
+          <span>Format</span>
+          <input id="set-template" type="text" spellcheck="false" />
+        </label>
+        <div class="chips" id="var-chips"></div>
+        <div class="hint">Preview: <code id="set-template-preview"></code></div>
+        <div class="hint">CUT_FROM / CUT_TO are written as <code>HH.MM.SS.mmm</code>. EXT includes the dot (e.g. <code>.mp4</code>).</div>
+
+        <h2>FFmpeg</h2>
+        <label class="field">
+          <span>FFmpeg folder <span class="muted">(leave empty to use PATH)</span></span>
+          <div class="row">
+            <input id="set-ffdir" type="text" spellcheck="false" placeholder="e.g. C:\ffmpeg\bin" />
+            <button id="btn-test-ff" class="ghost small">Test</button>
+          </div>
+        </label>
+        <div class="hint" id="ff-test-result"></div>
+
+        <h2>Defaults for new exports</h2>
+        <div class="grid2">
+          <label class="field"><span>Mode</span>
+            <select id="set-mode"><option value="bitrate">Bitrate</option><option value="size">Target file size</option></select>
+          </label>
+          <label class="field"><span>Video bitrate (kbps)</span><input id="set-bitrate" type="number" min="100" step="100" /></label>
+          <label class="field"><span>Target size (MB)</span><input id="set-size" type="number" min="1" step="1" /></label>
+          <label class="field"><span>Audio bitrate</span>
+            <select id="set-abitrate">
+              <option value="64">64 kbps</option><option value="96">96 kbps</option>
+              <option value="128">128 kbps</option><option value="160">160 kbps</option>
+              <option value="192">192 kbps</option><option value="256">256 kbps</option>
+              <option value="320">320 kbps</option>
+            </select>
+          </label>
+          <label class="field"><span>Encoder</span>
+            <select id="set-encoder">
+              <option value="libx264">H.264 (x264, CPU)</option>
+              <option value="libx265">H.265 / HEVC (x265, CPU)</option>
+              <option value="h264_nvenc">H.264 (NVIDIA NVENC)</option>
+              <option value="hevc_nvenc">H.265 (NVIDIA NVENC)</option>
+            </select>
+          </label>
+          <label class="field"><span>Speed preset</span>
+            <select id="set-preset">
+              <option>ultrafast</option><option>superfast</option><option>veryfast</option>
+              <option>faster</option><option>fast</option><option>medium</option>
+              <option>slow</option><option>slower</option><option>veryslow</option>
+            </select>
+          </label>
+        </div>
+        <label class="check"><input type="checkbox" id="set-twopass" /> Two-pass encoding by default</label>
+
+        <div class="modal-actions">
+          <button id="btn-set-cancel" class="ghost">Cancel</button>
+          <button id="btn-set-save" class="primary">Save</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- ============ EXPORT PROGRESS MODAL ============ -->
+    <div id="export-modal" class="modal" hidden>
+      <div class="modal-card narrow">
+        <h1 id="exp-title">Exporting…</h1>
+        <div id="exp-file" class="muted ellipsis"></div>
+        <div class="bar big"><div id="exp-bar"></div></div>
+        <div class="exp-stats"><span id="exp-pass"></span><span id="exp-pct"></span><span id="exp-speed"></span></div>
+        <div id="exp-error" class="error-text pre"></div>
+        <div class="modal-actions" id="exp-running-actions">
+          <button id="btn-exp-cancel" class="ghost">Cancel</button>
+        </div>
+        <div class="modal-actions" id="exp-done-actions" hidden>
+          <button id="btn-exp-reveal" class="ghost"><svg><use href="#i-folder"/></svg> Show in folder</button>
+          <button id="btn-exp-another" class="ghost">Open another file</button>
+          <button id="btn-exp-close" class="primary">Back to editor</button>
+        </div>
+      </div>
+    </div>
+
+    <div id="toast" class="toast" hidden></div>
+  </div>
+
+  <script type="module" src="/src/main.ts"></script>
+</body>
+</html>
