@@ -28,6 +28,40 @@ pub struct AudioOptions {
     /// Audio-relative stream indexes kept as their own tracks.
     pub separate: Vec<u32>,
     pub bitrate_kbps: u32,
+    /// Names for the output tracks, in output order (master first, then separate).
+    /// Empty / missing entries fall back to "Master (Tracks 1 + 3)" / "Track 2".
+    #[serde(default)]
+    pub titles: Vec<String>,
+}
+
+/// Audio part of the graph: optional amix filter, -map targets and track titles.
+pub fn audio_mapping(audio: &AudioOptions) -> (Option<String>, Vec<String>, Vec<String>) {
+    let mut filter = None;
+    let mut maps = Vec::new();
+    let mut titles = Vec::new();
+    match audio.master.len() {
+        0 => {}
+        1 => {
+            maps.push(format!("0:a:{}", audio.master[0]));
+            titles.push(format!("Track {}", audio.master[0] + 1));
+        }
+        n => {
+            let ins: String = audio.master.iter().map(|i| format!("[0:a:{i}]")).collect();
+            filter = Some(format!("{ins}amix=inputs={n}:duration=longest:normalize=0[amaster]"));
+            maps.push("[amaster]".into());
+            titles.push(format!("Master (Tracks {})", track_list(&audio.master)));
+        }
+    }
+    for s in &audio.separate {
+        maps.push(format!("0:a:{s}"));
+        titles.push(format!("Track {}", s + 1));
+    }
+    for (i, t) in titles.iter_mut().enumerate() {
+        if let Some(custom) = audio.titles.get(i).map(|c| c.trim()).filter(|c| !c.is_empty()) {
+            *t = custom.to_string();
+        }
+    }
+    (filter, maps, titles)
 }
 
 pub const PASSLOG: &str = "mc2pass";
@@ -192,25 +226,10 @@ pub fn build_args(
     }
 
     if !first_pass {
-        match audio.master.len() {
-            0 => {}
-            1 => {
-                maps.push(format!("0:a:{}", audio.master[0]));
-                audio_titles.push(format!("Track {}", audio.master[0] + 1));
-            }
-            n => {
-                let ins: String = audio.master.iter().map(|i| format!("[0:a:{i}]")).collect();
-                filters.push(format!(
-                    "{ins}amix=inputs={n}:duration=longest:normalize=0[amaster]"
-                ));
-                maps.push("[amaster]".into());
-                audio_titles.push(format!("Master (Tracks {})", track_list(&audio.master)));
-            }
-        }
-        for s in &audio.separate {
-            maps.push(format!("0:a:{s}"));
-            audio_titles.push(format!("Track {}", s + 1));
-        }
+        let (f, m, t) = audio_mapping(audio);
+        filters.extend(f);
+        maps.extend(m);
+        audio_titles = t;
     }
 
     if !filters.is_empty() {
@@ -262,51 +281,97 @@ pub fn build_args(
     a
 }
 
-/// Arguments for a low-res, seek-friendly H.264 preview used when the
-/// webview can't play the original file (e.g. some MKV/HEVC/AVI files).
-pub fn proxy_args(input: &str, output: &str) -> Vec<String> {
-    [
-        "-hide_banner",
-        "-loglevel",
-        "error",
-        "-nostdin",
-        "-y",
-        "-progress",
-        "pipe:1",
-        "-nostats",
-        "-i",
-        input,
-        "-map",
-        "0:v:0?",
-        "-map",
-        "0:a:0?",
-        "-vf",
-        "scale=-2:'min(540,ih)'",
-        "-c:v",
-        "libx264",
-        "-preset",
-        "ultrafast",
-        "-crf",
-        "28",
-        "-g",
-        "15",
-        "-pix_fmt",
-        "yuv420p",
-        "-c:a",
-        "aac",
-        "-b:a",
-        "128k",
-        "-ac",
-        "2",
-        "-sn",
-        "-dn",
-        "-movflags",
-        "+faststart",
-        output,
+/// Quick render of just the cut for the "Preview" button: a small muted video
+/// plus one .m4a per output audio track (so the player can switch / combine them).
+/// One ffmpeg run, single decode.
+pub fn cut_preview_args(
+    input: &str,
+    start: f64,
+    end: f64,
+    has_video: bool,
+    audio: &AudioOptions,
+    video_out: &str,
+    audio_outs: &[String],
+) -> Vec<String> {
+    let mut a: Vec<String> = [
+        "-hide_banner", "-loglevel", "error", "-nostdin", "-y", "-progress", "pipe:1", "-nostats",
     ]
     .iter()
     .map(|s| s.to_string())
-    .collect()
+    .collect();
+    if start > 0.0 {
+        a.extend(["-ss".into(), secs(start)]);
+    }
+    a.extend(["-t".into(), secs(end - start), "-i".into(), input.into()]);
+    let (filter, maps, _) = audio_mapping(audio);
+    if let Some(f) = filter {
+        a.extend(["-filter_complex".into(), f]);
+    }
+    if has_video {
+        for s in [
+            "-map", "0:v:0", "-vf", "scale=-2:'min(720,ih)'", "-c:v", "libx264", "-preset", "ultrafast",
+            "-crf", "24", "-g", "15", "-bf", "0", "-pix_fmt", "yuv420p", "-an", "-sn", "-dn",
+            "-movflags", "+faststart", video_out,
+        ] {
+            a.push(s.into());
+        }
+    }
+    for (m, out) in maps.iter().zip(audio_outs) {
+        for s in ["-map", m, "-vn", "-sn", "-dn", "-c:a", "aac", "-b:a", "160k", "-ac", "2", out] {
+            a.push(s.into());
+        }
+    }
+    a
+}
+
+/// How to build the in-app preview for files the webview can't play directly.
+#[derive(Debug, Clone, Copy, PartialEq, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum PreviewMode {
+    /// Copy video + audio into MP4 (seconds, disk-bound). e.g. MKV with H.264/AAC.
+    Remux,
+    /// Copy video, convert first audio track to AAC (e.g. MKV with AC3/DTS/PCM).
+    RemuxAac,
+    /// Full low-res H.264 re-encode with a short keyframe interval
+    /// (unsupported codecs, or a "fast-seek" copy of long-GOP footage).
+    Transcode,
+}
+
+pub fn preview_args(input: &str, output: &str, mode: PreviewMode, hevc: bool) -> Vec<String> {
+    let mut a: Vec<String> = [
+        "-hide_banner", "-loglevel", "error", "-nostdin", "-y",
+        "-progress", "pipe:1", "-nostats",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect();
+    if mode == PreviewMode::Transcode {
+        // Use the GPU video decoder when there is one (falls back to CPU automatically).
+        a.extend(["-hwaccel".to_string(), "auto".to_string()]);
+    }
+    a.extend(["-i", input, "-map", "0:v:0?", "-map", "0:a:0?"].iter().map(|s| s.to_string()));
+    let mut push = |xs: &[&str]| a.extend(xs.iter().map(|s| s.to_string()));
+    match mode {
+        PreviewMode::Remux | PreviewMode::RemuxAac => {
+            push(&["-c:v", "copy"]);
+            if hevc {
+                push(&["-tag:v", "hvc1"]);
+            }
+            if mode == PreviewMode::Remux {
+                push(&["-c:a", "copy"]);
+            } else {
+                push(&["-c:a", "aac", "-b:a", "192k", "-ac", "2"]);
+            }
+        }
+        PreviewMode::Transcode => push(&[
+            "-vf", "scale=-2:'min(720,ih)'",
+            "-c:v", "libx264", "-preset", "ultrafast", "-tune", "fastdecode",
+            "-crf", "26", "-g", "10", "-bf", "0", "-pix_fmt", "yuv420p",
+            "-c:a", "aac", "-b:a", "128k", "-ac", "2",
+        ]),
+    }
+    push(&["-sn", "-dn", "-map_metadata", "-1", "-f", "mp4", output]);
+    a
 }
 
 #[cfg(test)]
@@ -330,7 +395,7 @@ mod tests {
 
     #[test]
     fn master_mix_and_separate() {
-        let au = AudioOptions { master: vec![0, 2], separate: vec![1], bitrate_kbps: 160 };
+        let au = AudioOptions { master: vec![0, 2], separate: vec![1], bitrate_kbps: 160, titles: vec![] };
         let a = build_args("in.mkv", "out.mp4", 5.0, 20.5, Some(&v("libx264", false)), &au, None);
         let s = joined(&a);
         assert!(s.contains("-ss 5.000 -t 15.500 -i in.mkv"));
@@ -343,8 +408,42 @@ mod tests {
     }
 
     #[test]
+    fn custom_track_titles() {
+        let au = AudioOptions { master: vec![0, 2], separate: vec![1], bitrate_kbps: 160,
+            titles: vec!["Game + Mic".into(), "".into()] };
+        let s = joined(&build_args("in.mkv", "out.mkv", 0.0, 5.0, None, &au, None));
+        assert!(s.contains("title=Game + Mic") && s.contains("title=Track 2"));
+    }
+
+    #[test]
+    fn real_cut_preview() {
+        use std::process::Command;
+        if Command::new("ffmpeg").arg("-version").output().is_err() {
+            return;
+        }
+        let dir = std::env::temp_dir().join("mc-cutprev");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let src = dir.join("s.mkv");
+        assert!(Command::new("ffmpeg").args(["-v", "error", "-y", "-f", "lavfi", "-i", "testsrc2=size=640x360:rate=30:duration=6",
+            "-f", "lavfi", "-i", "sine=f=300:d=6", "-f", "lavfi", "-i", "sine=f=500:d=6", "-f", "lavfi", "-i", "sine=f=700:d=6",
+            "-map", "0", "-map", "1", "-map", "2", "-map", "3", "-c:v", "libx264", "-c:a", "aac"]).arg(&src).status().unwrap().success());
+        let au = AudioOptions { master: vec![0, 2], separate: vec![1], bitrate_kbps: 128, titles: vec![] };
+        let v = dir.join("v.mp4").to_string_lossy().into_owned();
+        let outs = vec![dir.join("a0.m4a").to_string_lossy().into_owned(), dir.join("a1.m4a").to_string_lossy().into_owned()];
+        let args = cut_preview_args(src.to_str().unwrap(), 1.0, 4.0, true, &au, &v, &outs);
+        let o = Command::new("ffmpeg").args(&args).output().unwrap();
+        assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+        for f in std::iter::once(&v).chain(outs.iter()) {
+            let p = Command::new("ffprobe").args(["-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0"]).arg(f).output().unwrap();
+            let d: f64 = String::from_utf8_lossy(&p.stdout).trim().parse().unwrap();
+            assert!((d - 3.0).abs() < 0.15, "{f}: {d}");
+        }
+    }
+
+    #[test]
     fn two_pass_first_pass_has_no_audio() {
-        let au = AudioOptions { master: vec![0], separate: vec![], bitrate_kbps: 128 };
+        let au = AudioOptions { master: vec![0], separate: vec![], bitrate_kbps: 128, titles: vec![] };
         let vo = v("libx264", true);
         assert_eq!(pass_count(Some(&vo)), 2);
         let p1 = joined(&build_args("in.mp4", "o.mp4", 0.0, 10.0, Some(&vo), &au, Some(1)));
@@ -358,7 +457,7 @@ mod tests {
 
     #[test]
     fn x265_and_nvenc() {
-        let au = AudioOptions { master: vec![], separate: vec![], bitrate_kbps: 128 };
+        let au = AudioOptions { master: vec![], separate: vec![], bitrate_kbps: 128, titles: vec![] };
         let s = joined(&build_args("i.mp4", "o.mkv", 0.0, 1.0, Some(&v("libx265", true)), &au, Some(2)));
         assert!(s.contains("pass=2:stats=mc2pass.log"));
         assert!(!s.contains("hvc1"));
@@ -394,7 +493,7 @@ mod tests {
         assert!(ok);
         let out = dir.join("src-CUT.mp4");
         let (input, output) = (src.to_str().unwrap(), out.to_str().unwrap());
-        let au = AudioOptions { master: vec![0, 2], separate: vec![1], bitrate_kbps: 128 };
+        let au = AudioOptions { master: vec![0, 2], separate: vec![1], bitrate_kbps: 128, titles: vec![] };
         let dur = 8.0;
         let audio_kbps = 128.0 * 2.0;
         let video_kbps = (1.0 * 1048576.0 * 8.0 * 0.97 / 1000.0 / dur - audio_kbps) as u32;
@@ -419,9 +518,47 @@ mod tests {
         assert!(size < 1.05 && size > 0.5, "size {size}");
     }
 
+
+    /// Preview modes against real files: MKV+AC3 (remux-aac), MOV+PCM, AVI/MPEG-4 (transcode).
+    #[test]
+    fn real_preview_modes() {
+        use std::process::Command;
+        if Command::new("ffmpeg").arg("-version").output().is_err() {
+            return;
+        }
+        let dir = std::env::temp_dir().join("mc-preview");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let make = |name: &str, extra: &[&str]| {
+            let p = dir.join(name);
+            let mut c = Command::new("ffmpeg");
+            c.args(["-v", "error", "-y", "-f", "lavfi", "-i", "testsrc2=size=640x360:rate=30:duration=4",
+                "-f", "lavfi", "-i", "sine=d=4", "-map", "0", "-map", "1"]).args(extra).arg(&p);
+            assert!(c.status().unwrap().success(), "{name}");
+            p
+        };
+        let cases = [
+            (make("a.mkv", &["-c:v", "libx264", "-c:a", "aac"]), PreviewMode::Remux),
+            (make("b.mkv", &["-c:v", "libx264", "-c:a", "ac3"]), PreviewMode::RemuxAac),
+            (make("c.mov", &["-c:v", "libx264", "-c:a", "pcm_s16le"]), PreviewMode::RemuxAac),
+            (make("d.avi", &["-c:v", "mpeg4", "-c:a", "mp3"]), PreviewMode::Transcode),
+        ];
+        for (src, mode) in cases {
+            let out = src.with_extension("preview.mp4");
+            let args = preview_args(src.to_str().unwrap(), out.to_str().unwrap(), mode, false);
+            let o = Command::new("ffmpeg").args(&args).output().unwrap();
+            assert!(o.status.success(), "{src:?} {mode:?}: {}", String::from_utf8_lossy(&o.stderr));
+            let p = Command::new("ffprobe").args(["-v", "error", "-show_entries", "stream=codec_name", "-of", "csv=p=0"])
+                .arg(&out).output().unwrap();
+            let codecs = String::from_utf8_lossy(&p.stdout).replace('\n', ",");
+            eprintln!("{mode:?} {:?} -> {codecs}", src.file_name().unwrap());
+            assert!(codecs.starts_with("h264,") && codecs.contains("aac"), "{codecs}");
+        }
+    }
+
     #[test]
     fn scaling_goes_through_filter_complex() {
-        let au = AudioOptions { master: vec![0], separate: vec![], bitrate_kbps: 128 };
+        let au = AudioOptions { master: vec![0], separate: vec![], bitrate_kbps: 128, titles: vec![] };
         let mut vo = v("libx264", false);
         vo.scale_height = Some(720);
         let s = joined(&build_args("i.mp4", "o.mp4", 0.0, 1.0, Some(&vo), &au, None));

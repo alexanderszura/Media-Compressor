@@ -25,9 +25,24 @@ export type Mode = "bitrate" | "size";
 export type Encoder = "libx264" | "libx265" | "h264_nvenc" | "hevc_nvenc";
 export type TrackRole = "master" | "separate" | "remove";
 
+export type OutputLocation = "source" | "folder";
+export type OutputFormat = "same" | "mp4" | "mkv";
+export type PreviewMode = "remux" | "remux-aac" | "transcode";
+
 export interface Settings {
   filenameTemplate: string;
   ffmpegDir: string;
+  /** Save next to the input file, or always into outputFolder. */
+  outputLocation: OutputLocation;
+  outputFolder: string;
+  /** Container for ${EXT}: keep the input's (MP4 if it can't hold H.264/AAC), or force one. */
+  outputFormat: OutputFormat;
+  /** Build a frequent-keyframe preview in the background when seeking is slow. */
+  fastSeek: boolean;
+  /** Default name for the mixed Master track ("" = "Master (Tracks 1 + 3)"). */
+  masterTrackName: string;
+  /** Default names by source track number (index 0 = track 1). "" = keep the file's own name. */
+  trackNames: string[];
   mode: Mode;
   videoBitrate: number;
   targetSizeMB: number;
@@ -46,6 +61,8 @@ export interface AudioTrack {
   layout: string;
   bitrate: number; // kbps, 0 if unknown
   role: TrackRole;
+  /** Name written to the output when this track is kept separately. */
+  outName: string;
 }
 
 export interface Progress {
@@ -53,6 +70,19 @@ export interface Progress {
   passes: number;
   fraction: number;
   speed: string;
+}
+
+export interface AudioRequest {
+  master: number[];
+  separate: number[];
+  bitrateKbps: number;
+  /** Output track names in output order (master first). */
+  titles: string[];
+}
+
+export interface CutPreviewResult {
+  videoUrl: string | null;
+  audioUrls: string[];
 }
 
 export interface ExportRequest {
@@ -69,7 +99,23 @@ export interface ExportRequest {
     scaleHeight: number | null;
     sizeMode: boolean;
   } | null;
-  audio: { master: number[]; separate: number[]; bitrateKbps: number };
+  audio: AudioRequest;
+}
+
+export interface FfmpegStatus {
+  ok: boolean;
+  path: string;
+  source: "settings" | "managed" | "bundled" | "path" | "";
+  version: string;
+  major: number | null;
+  canAutoInstall: boolean;
+  error: string;
+}
+
+export interface InstallProgress {
+  stage: "download" | "verify" | "extract";
+  done: number;
+  total: number;
 }
 
 export interface ExportResult {

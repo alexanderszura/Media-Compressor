@@ -168,3 +168,51 @@ code { background: #1a1a1a; padding: 1px 5px; border-radius: 3px; font-family: C
 .toast { position: fixed; left: 50%; bottom: 110px; transform: translateX(-50%); background: #000000e0; color: #fff;
   padding: 8px 16px; border-radius: 6px; z-index: 20; font-size: 14px; max-width: 80vw; pointer-events: none; }
 .toast.error { background: #6b2620; }
+
+/* ---------- additions: setup screen, save location, seek status ---------- */
+.setup { position: fixed; inset: 0; z-index: 30; background: var(--bg); display: flex; align-items: center; justify-content: center; }
+.setup-card { width: min(520px, calc(100vw - 32px)); text-align: center; user-select: text; }
+.setup-card .drop-logo { margin: 0 0 14px; }
+.setup-card h1 { margin-bottom: 8px; }
+.setup-card p { margin: 0 0 6px; line-height: 1.5; }
+.setup-card .exp-stats { min-height: 18px; }
+.setup-card .error-text { text-align: left; margin-top: 10px; }
+.setup-actions { display: flex; justify-content: center; gap: 10px; margin-top: 18px; flex-wrap: wrap; }
+.radio-group { display: flex; flex-direction: column; gap: 2px; }
+.radio-group .check { margin: 0 0 4px; }
+.check input[type=radio] { accent-color: var(--accent); width: 15px; height: 15px; }
+.row.indent { margin-left: 23px; }
+.row.indent.disabled { opacity: .45; pointer-events: none; }
+.dest-row { display: flex; align-items: center; gap: 10px; justify-content: space-between; }
+.dest-row .hint { margin: 0; }
+.seek-status { color: var(--muted); font-size: 12.5px; margin-left: 10px; }
+.seek-status.ready { color: #6fc28b; }
+#stage-msg-text { white-space: pre-line; }
+
+/* ---------- track names ---------- */
+.tn-list { display: grid; grid-template-columns: 1fr 1fr; gap: 6px 16px; margin-bottom: 8px; }
+.tn-row { display: flex; align-items: center; gap: 8px; }
+.tn-row span { width: 54px; flex: none; font-size: 13px; color: #bbb; }
+.tn-row input, .master-name input, .track-name { background: #1c1c1c; border: 1px solid #4a4a4a; border-radius: 5px; padding: 5px 8px; outline: none; width: 100%; min-width: 0; }
+.tn-row input:focus, .master-name input:focus, .track-name:focus { border-color: var(--accent); }
+.master-name { display: flex; align-items: center; gap: 10px; background: #1d2a2e; border: 1px solid #2c4a52; border-radius: 6px; padding: 8px 10px; }
+.master-name span { flex: none; font-size: 13px; color: #bfe3ec; }
+.track .out { width: 190px; flex: none; display: flex; justify-content: flex-end; }
+.small-note { font-size: 12px; }
+
+/* ---------- cut preview ---------- */
+.preview-card { width: min(860px, calc(100vw - 32px)); }
+.pv-head { display: flex; justify-content: space-between; align-items: flex-start; margin-bottom: 12px; }
+.pv-head h1 { margin-bottom: 2px !important; }
+.pv-loading { padding: 40px 10px; text-align: center; }
+.pv-stage { background: #000; border-radius: 6px; overflow: hidden; display: flex; justify-content: center; }
+#pv-video { width: 100%; max-height: 58vh; display: block; }
+.pv-controls { display: flex; align-items: center; gap: 12px; margin: 10px 0 12px; }
+.pv-controls input[type=range] { flex: 1; accent-color: var(--accent); }
+.pv-time { font: 13px Consolas, monospace; color: #ccc; min-width: 120px; text-align: right; }
+.pv-tracks-label { font-size: 13px; color: #bbb; margin-bottom: 6px; }
+.pv-tracks { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 10px; }
+.pv-tracks label { display: flex; align-items: center; gap: 7px; background: #1d1d1d; border: 1px solid #3a3a3a; border-radius: 6px; padding: 6px 11px; cursor: pointer; }
+.pv-tracks label.on { border-color: var(--accent); background: #1d2a2e; }
+.pv-tracks input { accent-color: var(--accent); }
+.ghost.big { font-size: 16px; padding: 7px 18px; }

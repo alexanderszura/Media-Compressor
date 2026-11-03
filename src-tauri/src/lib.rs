@@ -1,6 +1,11 @@
 mod ffmpeg;
+mod installer;
+mod media_server;
 
-use ffmpeg::{AudioOptions, VideoOptions};
+use ffmpeg::{AudioOptions, PreviewMode, VideoOptions};
+use media_server::MediaServer;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::OnceLock;
 use serde::{Deserialize, Serialize};
 use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
@@ -23,18 +28,33 @@ struct JobSlot {
 #[derive(Default)]
 struct Jobs {
     export: Arc<Mutex<JobSlot>>,
-    proxy: Arc<Mutex<JobSlot>>,
+    /// Preview needed before the file can play at all (remux / transcode).
+    preview: Arc<Mutex<JobSlot>>,
+    /// Optional background "fast-seek" copy for long-GOP footage.
+    fastseek: Arc<Mutex<JobSlot>>,
+    /// "Preview" button on the export screen.
+    cutpreview: Arc<Mutex<JobSlot>>,
 }
 
 impl Jobs {
     fn slot(&self, kind: &str) -> Arc<Mutex<JobSlot>> {
-        if kind == "proxy" {
-            self.proxy.clone()
-        } else {
-            self.export.clone()
+        match kind {
+            "preview" | "proxy" => self.preview.clone(),
+            "fastseek" => self.fastseek.clone(),
+            "cutpreview" => self.cutpreview.clone(),
+            _ => self.export.clone(),
         }
     }
 }
+
+#[derive(Default)]
+struct InstallState {
+    cancel: AtomicBool,
+    running: AtomicBool,
+}
+
+/// Folder where the app keeps its own FFmpeg download.
+static MANAGED_DIR: OnceLock<PathBuf> = OnceLock::new();
 
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -49,31 +69,46 @@ struct Progress {
 // Locating ffmpeg / ffprobe
 // ---------------------------------------------------------------------------
 
-/// Resolve a tool. Order: folder from Settings -> next to this app's exe -> PATH.
-fn tool_path(dir: &str, name: &str) -> PathBuf {
-    let exe = if cfg!(windows) {
+fn exe_name(name: &str) -> String {
+    if cfg!(windows) {
         format!("{name}.exe")
     } else {
         name.to_string()
-    };
+    }
+}
+
+/// Resolve a tool. Order: folder from Settings -> FFmpeg the app downloaded
+/// -> next to this app's exe -> PATH.
+fn tool_path(dir: &str, name: &str) -> PathBuf {
+    tool_path_with_source(dir, name).0
+}
+
+fn tool_path_with_source(dir: &str, name: &str) -> (PathBuf, &'static str) {
+    let exe = exe_name(name);
     let d = dir.trim().trim_matches('"');
     if !d.is_empty() {
         let p = Path::new(d);
         // Allow the user to paste the path to ffmpeg.exe itself.
         if p.is_file() {
-            return p.with_file_name(&exe);
+            return (p.with_file_name(&exe), "settings");
         }
-        return p.join(&exe);
+        return (p.join(&exe), "settings");
+    }
+    if let Some(m) = MANAGED_DIR.get() {
+        let c = m.join(&exe);
+        if c.is_file() {
+            return (c, "managed");
+        }
     }
     if let Ok(cur) = std::env::current_exe() {
         if let Some(parent) = cur.parent() {
             let c = parent.join(&exe);
             if c.is_file() {
-                return c;
+                return (c, "bundled");
             }
         }
     }
-    PathBuf::from(exe)
+    (PathBuf::from(exe), "path")
 }
 
 fn command(program: &Path) -> Command {
@@ -223,8 +258,9 @@ fn run_ffmpeg(
 // ---------------------------------------------------------------------------
 
 const VIDEO_EXTS: &[&str] = &[
-    "mp4", "mkv", "mov", "m4v", "webm", "avi", "wmv", "flv", "ts", "mts", "m2ts", "mpg", "mpeg",
-    "3gp", "ogv",
+    "mp4", "mkv", "mov", "m4v", "webm", "avi", "wmv", "asf", "flv", "f4v", "ts", "mts", "m2ts",
+    "m2t", "mpg", "mpeg", "m2v", "vob", "mod", "tod", "3gp", "3g2", "ogv", "divx", "xvid", "dv",
+    "mxf", "rm", "rmvb", "nut", "y4m", "hevc", "h264", "264", "265", "ivf", "gif",
 ];
 
 #[tauri::command]
@@ -387,15 +423,36 @@ async fn export_video(
     .map_err(|e| e.to_string())?
 }
 
+fn previews_dir(app: &AppHandle) -> Result<PathBuf, String> {
+    Ok(app
+        .path()
+        .app_cache_dir()
+        .map_err(|e| e.to_string())?
+        .join("previews"))
+}
+
+#[derive(Serialize)]
+struct PreviewResult {
+    url: String,
+    path: String,
+}
+
+/// Build a playable preview copy. `kind` is "preview" (needed to play at all)
+/// or "fastseek" (optional background copy with frequent keyframes).
 #[tauri::command]
-async fn make_proxy(
+#[allow(clippy::too_many_arguments)]
+async fn make_preview(
     app: AppHandle,
     jobs: State<'_, Jobs>,
+    server: State<'_, Arc<MediaServer>>,
     path: String,
+    mode: PreviewMode,
+    hevc: bool,
+    kind: String,
     ffmpeg_dir: String,
     duration: f64,
-) -> Result<String, String> {
-    let slot = jobs.slot("proxy");
+) -> Result<PreviewResult, String> {
+    let slot = jobs.slot(&kind);
     {
         let mut s = slot.lock().unwrap();
         if let Some(c) = s.child.as_mut() {
@@ -403,28 +460,248 @@ async fn make_proxy(
         }
         s.cancelled = false;
     }
-    let dir = app
-        .path()
-        .app_cache_dir()
-        .map_err(|e| e.to_string())?
-        .join("previews");
+    let dir = previews_dir(&app)?;
+    let server = server.inner().clone();
+    let event = format!("{kind}-progress");
     tauri::async_runtime::spawn_blocking(move || {
-        // Only keep one preview around.
+        std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0);
+        let out = dir.join(format!("{kind}-{stamp}.mp4"));
+        let out_s = out.to_string_lossy().into_owned();
+        let program = tool_path(&ffmpeg_dir, "ffmpeg");
+        let args = ffmpeg::preview_args(&path, &out_s, mode, hevc);
+        if let Err(e) = run_ffmpeg(&app, &slot, &program, &args, &dir, duration, &event, 1, 1) {
+            let _ = std::fs::remove_file(&out);
+            return Err(e);
+        }
+        Ok(PreviewResult { url: server.url_for(&out), path: out_s })
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CutPreviewRequest {
+    input: String,
+    start: f64,
+    end: f64,
+    has_video: bool,
+    ffmpeg_dir: String,
+    audio: AudioOptions,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CutPreviewResult {
+    video_url: Option<String>,
+    /// One URL per output audio track, in output order.
+    audio_urls: Vec<String>,
+}
+
+/// Render just the cut (low-res video + each output audio track as its own file)
+/// so the user can hear the Master mix / kept tracks before exporting.
+#[tauri::command]
+async fn render_cut_preview(
+    app: AppHandle,
+    jobs: State<'_, Jobs>,
+    server: State<'_, Arc<MediaServer>>,
+    req: CutPreviewRequest,
+) -> Result<CutPreviewResult, String> {
+    if req.end <= req.start {
+        return Err("The cut end must be after the cut start.".into());
+    }
+    let slot = jobs.slot("cutpreview");
+    {
+        let mut s = slot.lock().unwrap();
+        if let Some(c) = s.child.as_mut() {
+            let _ = c.kill();
+        }
+        s.cancelled = false;
+    }
+    let dir = previews_dir(&app)?.join("cut");
+    let server = server.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
         let stamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis())
             .unwrap_or(0);
-        let out = dir.join(format!("preview-{stamp}.mp4"));
-        let out_s = out.to_string_lossy().into_owned();
-        let program = tool_path(&ffmpeg_dir, "ffmpeg");
-        let args = ffmpeg::proxy_args(&path, &out_s);
-        run_ffmpeg(&app, &slot, &program, &args, &dir, duration, "proxy-progress", 1, 1)?;
-        Ok(out_s)
+        let video_out = dir.join(format!("cut-{stamp}.mp4"));
+        let n_audio = ffmpeg::audio_mapping(&req.audio).1.len();
+        let audio_outs: Vec<PathBuf> =
+            (0..n_audio).map(|i| dir.join(format!("cut-{stamp}-a{i}.m4a"))).collect();
+        let audio_strs: Vec<String> =
+            audio_outs.iter().map(|p| p.to_string_lossy().into_owned()).collect();
+        if !req.has_video && n_audio == 0 {
+            return Err("Nothing to preview — select at least one audio track.".into());
+        }
+        let args = ffmpeg::cut_preview_args(
+            &req.input,
+            req.start,
+            req.end,
+            req.has_video,
+            &req.audio,
+            &video_out.to_string_lossy(),
+            &audio_strs,
+        );
+        let program = tool_path(&req.ffmpeg_dir, "ffmpeg");
+        run_ffmpeg(&app, &slot, &program, &args, &dir, req.end - req.start, "cutpreview-progress", 1, 1)?;
+        Ok(CutPreviewResult {
+            video_url: req.has_video.then(|| server.url_for(&video_out)),
+            audio_urls: audio_outs.iter().map(|p| server.url_for(p)).collect(),
+        })
     })
     .await
     .map_err(|e| e.to_string())?
+}
+
+/// Delete preview copies of previously opened files.
+#[tauri::command]
+fn clear_previews(app: AppHandle, jobs: State<'_, Jobs>) {
+    for kind in ["preview", "fastseek", "cutpreview"] {
+        let slot = jobs.slot(kind);
+        let mut s = slot.lock().unwrap();
+        s.cancelled = true;
+        if let Some(c) = s.child.as_mut() {
+            let _ = c.kill();
+        }
+    }
+    if let Ok(dir) = previews_dir(&app) {
+        // Files may still be locked for a moment on Windows; best effort.
+        let _ = std::fs::remove_dir_all(dir);
+    }
+}
+
+/// URL the <video> element uses to stream a file from the local media server.
+#[tauri::command]
+fn media_url(server: State<'_, Arc<MediaServer>>, path: String) -> String {
+    server.url_for(Path::new(&path))
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct FfmpegStatus {
+    ok: bool,
+    path: String,
+    source: String,
+    version: String,
+    major: Option<u32>,
+    can_auto_install: bool,
+    error: String,
+}
+
+fn version_of(p: &Path) -> Result<String, String> {
+    let out = command(p).arg("-version").output().map_err(|e| e.to_string())?;
+    if !out.status.success() {
+        return Err(format!("{} -version failed", p.display()));
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).lines().next().unwrap_or("").to_string())
+}
+
+/// "ffmpeg version 8.1-full_build..." -> Some(8); "N-12345-g..." (git builds) -> None
+fn parse_major(version_line: &str) -> Option<u32> {
+    let v = version_line.split_whitespace().nth(2)?;
+    let v = v.trim_start_matches('n');
+    v.split(['.', '-']).next()?.parse().ok()
+}
+
+#[tauri::command]
+async fn ffmpeg_status(ffmpeg_dir: String) -> FfmpegStatus {
+    tauri::async_runtime::spawn_blocking(move || {
+        let (ff, source) = tool_path_with_source(&ffmpeg_dir, "ffmpeg");
+        let probe = tool_path(&ffmpeg_dir, "ffprobe");
+        let can_auto_install = installer::platform_tag().is_some();
+        match (version_of(&ff), version_of(&probe)) {
+            (Ok(v), Ok(_)) => FfmpegStatus {
+                ok: true,
+                path: ff.to_string_lossy().into_owned(),
+                source: source.into(),
+                major: parse_major(&v),
+                version: v,
+                can_auto_install,
+                error: String::new(),
+            },
+            (a, b) => FfmpegStatus {
+                ok: false,
+                path: ff.to_string_lossy().into_owned(),
+                source: source.into(),
+                version: String::new(),
+                major: None,
+                can_auto_install,
+                error: a.err().or(b.err()).unwrap_or_default(),
+            },
+        }
+    })
+    .await
+    .unwrap_or(FfmpegStatus {
+        ok: false,
+        path: String::new(),
+        source: String::new(),
+        version: String::new(),
+        major: None,
+        can_auto_install: false,
+        error: "status check failed".into(),
+    })
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct InstallProgress {
+    stage: &'static str,
+    done: u64,
+    total: u64,
+}
+
+/// Download FFmpeg into the app's data folder (Windows).
+#[tauri::command]
+async fn install_ffmpeg(app: AppHandle, state: State<'_, Arc<InstallState>>) -> Result<String, String> {
+    let tag = installer::platform_tag()
+        .ok_or("Automatic install isn't available on this OS. Install FFmpeg with your package manager.")?;
+    let dir = MANAGED_DIR.get().cloned().ok_or("App data folder unavailable")?;
+    let state = state.inner().clone();
+    if state.running.swap(true, Ordering::SeqCst) {
+        return Err("FFmpeg is already being installed.".into());
+    }
+    state.cancel.store(false, Ordering::SeqCst);
+    let st = state.clone();
+    let res = tauri::async_runtime::spawn_blocking(move || {
+        let emit = |s: installer::Stage| {
+            let p = match s {
+                installer::Stage::Download { done, total } => InstallProgress { stage: "download", done, total },
+                installer::Stage::Verify => InstallProgress { stage: "verify", done: 0, total: 0 },
+                installer::Stage::Extract => InstallProgress { stage: "extract", done: 0, total: 0 },
+            };
+            let _ = app.emit("ffmpeg-install-progress", p);
+        };
+        let name = installer::install(&dir, tag, &st.cancel, &emit)?;
+        version_of(&dir.join(exe_name("ffmpeg")))
+            .map_err(|e| format!("Installed {name}, but it won't run: {e}"))
+    })
+    .await
+    .map_err(|e| e.to_string())
+    .and_then(|r| r);
+    state.running.store(false, Ordering::SeqCst);
+    res
+}
+
+#[tauri::command]
+fn cancel_install(state: State<'_, Arc<InstallState>>) {
+    state.cancel.store(true, Ordering::SeqCst);
+}
+
+#[tauri::command]
+async fn pick_folder(app: AppHandle, title: String) -> Option<String> {
+    app.dialog()
+        .file()
+        .set_title(title)
+        .blocking_pick_folder()
+        .and_then(|f| f.into_path().ok())
+        .map(|p| p.to_string_lossy().into_owned())
 }
 
 #[tauri::command]
@@ -493,21 +770,62 @@ fn reveal_in_folder(path: String) -> Result<(), String> {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    let server = MediaServer::start().expect("could not start local media server");
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .manage(Jobs::default())
+        .manage(server)
+        .manage(Arc::new(InstallState::default()))
+        .setup(|app| {
+            if let Ok(d) = app.path().app_local_data_dir() {
+                let _ = MANAGED_DIR.set(d.join("ffmpeg"));
+            }
+            Ok(())
+        })
         .invoke_handler(tauri::generate_handler![
             pick_file,
+            pick_folder,
             check_ffmpeg,
+            ffmpeg_status,
+            install_ffmpeg,
+            cancel_install,
             probe,
+            media_url,
             export_video,
-            make_proxy,
+            make_preview,
+            render_cut_preview,
+            clear_previews,
             cancel_job,
             load_settings,
             save_settings,
             path_exists,
             reveal_in_folder
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application")
+        .run(|app, event| {
+            if let tauri::RunEvent::Exit = event {
+                let jobs = app.state::<Jobs>();
+                for kind in ["export", "preview", "fastseek", "cutpreview"] {
+                    if let Some(c) = jobs.slot(kind).lock().unwrap().child.as_mut() {
+                        let _ = c.kill();
+                    }
+                }
+                if let Ok(dir) = previews_dir(app) {
+                    let _ = std::fs::remove_dir_all(dir);
+                }
+            }
+        });
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn parses_ffmpeg_versions() {
+        use super::parse_major;
+        assert_eq!(parse_major("ffmpeg version 8.1-full_build-www.gyan.dev Copyright"), Some(8));
+        assert_eq!(parse_major("ffmpeg version n9.0-12-gabc Copyright"), Some(9));
+        assert_eq!(parse_major("ffmpeg version 4.4.2-0ubuntu0.22.04.1 Copyright"), Some(4));
+        assert_eq!(parse_major("ffmpeg version N-117000-g1234 Copyright"), None);
+    }
 }

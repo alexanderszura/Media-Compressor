@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
-  applyTemplate, bitrateForTargetSize, estimateSizeMB, formatCutVar, formatTime, parseRate,
-  parseTime, splitPath, templateVars,
+  applyTemplate, bitrateForTargetSize, estimateSizeMB, formatCutVar, formatTime, joinPath, median,
+  outputExt, parseRate, parseTime, planPreview, splitPath, templateVars,
 } from "../src/util";
 
 describe("time", () => {
@@ -27,6 +27,31 @@ describe("filename template", () => {
       .toBe("Game Clip_00.00.05.000-00.01.10.500.mp4");
     expect(applyTemplate("a:b${EXT}", vars)).toBe("a_b.mp4");
     expect(applyTemplate("", vars)).toBe("Game Clip-CUT.mp4");
+  });
+});
+
+describe("output & preview planning", () => {
+  it("picks output extension", () => {
+    expect(outputExt(".mkv")).toBe(".mkv");
+    expect(outputExt(".avi")).toBe(".mp4");
+    expect(outputExt(".MOV")).toBe(".MOV");
+    expect(outputExt(".mkv", "mp4")).toBe(".mp4");
+    expect(templateVars("C:\\a\\b.wmv", 0, 1).EXT).toBe(".mp4");
+    expect(joinPath("D:\\Clips", "x.mp4")).toBe("D:\\Clips\\x.mp4");
+    expect(joinPath("/home/me/", "x.mp4")).toBe("/home/me/x.mp4");
+  });
+
+  it("plans previews from codecs", () => {
+    const chrome = (m: string) => !/hvc1|ac-3|ec-3/.test(m); // no HEVC / AC3
+    expect(planPreview(".mp4", "h264", "aac", chrome)).toEqual({ kind: "direct" });
+    expect(planPreview(".mkv", "h264", "aac", chrome)).toEqual({ kind: "preview", mode: "remux" });
+    expect(planPreview(".mkv", "h264", "ac3", chrome)).toEqual({ kind: "preview", mode: "remux-aac" });
+    expect(planPreview(".mov", "h264", "pcm_s16le", chrome)).toEqual({ kind: "preview", mode: "remux-aac" });
+    expect(planPreview(".mp4", "hevc", "aac", chrome)).toEqual({ kind: "preview", mode: "transcode" });
+    expect(planPreview(".mp4", "hevc", "aac", () => true)).toEqual({ kind: "direct" });
+    expect(planPreview(".avi", "mpeg4", "mp3", chrome)).toEqual({ kind: "preview", mode: "transcode" });
+    expect(planPreview(".webm", "vp9", "opus", chrome)).toEqual({ kind: "direct" });
+    expect(median([300, 100, 200])).toBe(200);
   });
 });
 

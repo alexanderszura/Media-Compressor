@@ -1,12 +1,13 @@
-import { invoke, convertFileSrc } from "@tauri-apps/api/core";
+import { convertFileSrc, invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import {
   applyTemplate, bitrateForTargetSize, estimateSizeMB, formatBytes, formatDuration, formatTime,
-  parseRate, parseTime, splitPath, templateVars, TEMPLATE_VARS,
+  joinPath, median, parseRate, parseTime, planPreview, splitPath, templateVars, TEMPLATE_VARS,
 } from "./util";
 import type {
-  AudioTrack, Encoder, ExportRequest, ExportResult, Mode, ProbeResult, Progress, Settings, TrackRole,
+  AudioTrack, CutPreviewResult, Encoder, ExportRequest, ExportResult, FfmpegStatus, InstallProgress, Mode,
+  OutputFormat, OutputLocation, PreviewMode, ProbeResult, Progress, Settings, TrackRole,
 } from "./types";
 
 // ---------------------------------------------------------------------------
@@ -43,6 +44,12 @@ function toast(msg: string, error = false): void {
 const DEFAULT_SETTINGS: Settings = {
   filenameTemplate: "${FILENAME}-CUT${EXT}",
   ffmpegDir: "",
+  outputLocation: "source",
+  outputFolder: "",
+  outputFormat: "same",
+  fastSeek: true,
+  masterTrackName: "Master",
+  trackNames: [],
   mode: "bitrate",
   videoBitrate: 4000,
   targetSizeMB: 25,
@@ -68,6 +75,9 @@ interface ExportConfig {
   filename: string;
   nameKey: string; // file+cut the filename was generated/edited for
   nameEdited: boolean;
+  outputDir: string; // "" = decide from settings at export time
+  masterName: string;
+  masterNameEdited: boolean;
 }
 
 interface Media {
@@ -79,16 +89,28 @@ interface Media {
   height: number;
   videoKbps: number;
   audio: AudioTrack[];
+  videoCodec: string | null;
+  firstAudioCodec: string | null;
 }
 
+/** What the <video> element is currently showing. */
+type Source = "none" | "direct" | PreviewMode | "fastseek";
+
 let media: Media | null = null;
+let source: Source = "none";
+let fastSeekState: "idle" | "building" | "ready" | "failed" = "idle";
+const seekSamples: number[] = [];
+let seekQueued: number | null = null;
+let seekStartedAt = 0;
+/** File behind the current source, and whether we've already retried it via the asset protocol. */
+let sourcePath = "";
+let triedAssetFallback = false;
 let cfg: ExportConfig = freshConfig();
 let inPt = 0;
 let outPt = 0;
 let curTime = 0;
 let zoom = 1;
 let viewStart = 0;
-let usingProxy = false;
 let loadToken = 0;
 let exporting = false;
 let lastOutput = "";
@@ -108,8 +130,40 @@ function freshConfig(): ExportConfig {
     filename: "",
     nameKey: "",
     nameEdited: false,
+    outputDir: "",
+    masterName: "",
+    masterNameEdited: false,
   };
 }
+
+/** Default output name for a kept track: Settings name for that number, else the file's own name. */
+function defaultTrackName(t: AudioTrack): string {
+  return settings.trackNames[t.index]?.trim() || t.title || "";
+}
+
+function defaultMasterName(): string {
+  const m = audioPlan().master;
+  if (m.length === 1 && media) return defaultTrackName(media.audio[m[0]]);
+  return settings.masterTrackName.trim();
+}
+
+/** Output track names in output order, as sent to FFmpeg. */
+function outputTitles(): string[] {
+  const plan = audioPlan();
+  const names = plan.master.length ? [cfg.masterName.trim()] : [];
+  for (const i of plan.separate) names.push(media!.audio[i].outName.trim());
+  return names;
+}
+
+/** Folder the export will be written to. */
+function destinationDir(): string {
+  if (cfg.outputDir) return cfg.outputDir;
+  if (settings.outputLocation === "folder" && settings.outputFolder.trim()) return settings.outputFolder.trim();
+  return media ? splitPath(media.path).dir : "";
+}
+
+const defaultFilename = (): string =>
+  media ? applyTemplate(settings.filenameTemplate, templateVars(media.path, inPt, outPt, settings.outputFormat)) : "";
 
 const frameDur = (): number => 1 / (media?.fps || 30);
 const videoReady = (): boolean => video.readyState >= 1 && !!video.src;
@@ -135,9 +189,17 @@ const hideStageMsg = (): void => { $("stage-msg").hidden = true; };
 async function openFile(path: string): Promise<void> {
   if (exporting) return;
   const token = ++loadToken;
-  invoke("cancel_job", { kind: "proxy" }).catch(() => {});
   showScreen("editor");
   showStageMsg("Reading file…");
+  video.pause();
+  video.removeAttribute("src");
+  video.load();
+  source = "none";
+  fastSeekState = "idle";
+  seekSamples.length = 0;
+  seekQueued = null;
+  setSeekStatus("");
+  await invoke("clear_previews").catch(() => {});
 
   let info: ProbeResult;
   try {
@@ -172,10 +234,14 @@ async function openFile(path: string): Promise<void> {
       layout: s.channel_layout ?? "",
       bitrate: Math.round(parseInt(s.bit_rate ?? "0") / 1000),
       role: i === 0 ? "master" : "separate",
+      outName: "",
     })),
+    videoCodec: v?.codec_name ?? null,
+    firstAudioCodec: audioStreams[0]?.codec_name ?? null,
   };
   // Generic handler names from muxers aren't useful titles.
-  for (const t of media.audio) if (/^(SoundHandler|ISO Media file)/i.test(t.title)) t.title = "";
+  for (const t of media.audio) if (/^(SoundHandler|ISO Media file|Core Media Audio)/i.test(t.title)) t.title = "";
+  for (const t of media.audio) t.outName = defaultTrackName(t);
 
   cfg = freshConfig();
   overwriteConfirmedFor = "";
@@ -185,28 +251,70 @@ async function openFile(path: string): Promise<void> {
   zoom = 1;
   viewStart = 0;
   ($<HTMLSelectElement>("zoom")).value = "1";
-  usingProxy = false;
 
-  const { base } = splitPath(path);
+  const { base, ext } = splitPath(path);
   const bits = [media.hasVideo ? `${media.width}×${media.height}` : "audio only"];
   if (media.hasVideo) bits.push(`${Math.round(media.fps * 100) / 100} fps`);
+  if (media.videoCodec) bits.push(media.videoCodec.toUpperCase());
   bits.push(`${media.audio.length} audio track${media.audio.length === 1 ? "" : "s"}`);
   $("file-title").textContent = `${base}  —  ${bits.join(" · ")}`;
   document.title = `${base} – Media Compressor`;
 
   $("dropzone").hidden = true;
   video.hidden = false;
-  showStageMsg("Loading preview…");
-  video.src = convertFileSrc(path);
-  video.load();
   updateCutUI();
+
+  const plan = planPreview(ext, media.videoCodec, media.firstAudioCodec, (m) => video.canPlayType(m) !== "");
+  if (plan.kind === "direct") {
+    showStageMsg("Loading…");
+    setSource(await invoke<string>("media_url", { path }), "direct", path);
+  } else {
+    void buildPreview(plan.mode, token);
+  }
+}
+
+function setSource(url: string, kind: Source, path: string): void {
+  source = kind;
+  sourcePath = path;
+  triedAssetFallback = false;
+  video.src = url;
+  video.load();
+}
+
+const PREVIEW_MSG: Record<PreviewMode, string> = {
+  "remux": "Preparing this file for preview (repackaging, no re-encode)…",
+  "remux-aac": "Preparing this file for preview (converting the audio)…",
+  "transcode": "This video format can't be played directly — creating a preview copy…",
+};
+
+/** Make a playable copy (remux/transcode) when the webview can't play the original. */
+async function buildPreview(mode: PreviewMode, token = loadToken): Promise<void> {
+  if (!media) return;
+  showStageMsg(PREVIEW_MSG[mode], 0);
+  try {
+    const res = await invoke<{ url: string; path: string }>("make_preview", {
+      path: media.path, mode, hevc: media.videoCodec === "hevc", kind: "preview",
+      ffmpegDir: settings.ffmpegDir, duration: media.duration,
+    });
+    if (token !== loadToken) return;
+    showStageMsg("Loading…");
+    setSource(res.url, mode, res.path);
+  } catch (e) {
+    if (token !== loadToken || String(e) === "Cancelled") return;
+    if (mode !== "transcode") {
+      // e.g. a codec that won't go into MP4 as-is — fall back to a full transcode.
+      void buildPreview("transcode", token);
+      return;
+    }
+    showStageMsg(`Preview failed — you can still set cut points by time.\n${e}`);
+  }
 }
 
 function onVideoMeta(): void {
   if (!media) return;
-  if (media.hasVideo && video.videoWidth === 0 && !usingProxy) {
-    // Container opened but the codec can't be decoded (e.g. HEVC without extension).
-    void makeProxy();
+  if (media.hasVideo && video.videoWidth === 0 && source !== "transcode" && source !== "fastseek") {
+    // Container opened but the video codec can't be decoded.
+    void buildPreview("transcode");
     return;
   }
   if (!media.duration && isFinite(video.duration)) {
@@ -214,33 +322,70 @@ function onVideoMeta(): void {
     outPt = media.duration;
   }
   hideStageMsg();
+  seekQueued = null;
   video.currentTime = curTime;
   video.playbackRate = parseFloat(($<HTMLSelectElement>("speed")).value);
   updateCutUI();
 }
 
 function onVideoError(): void {
-  if (!media || !video.src) return;
-  if (!usingProxy) void makeProxy();
+  if (!media || !video.getAttribute("src")) return;
+  // If streaming from the local media server failed (e.g. blocked by the webview),
+  // retry the same file through Tauri's asset protocol before re-encoding anything.
+  if (!triedAssetFallback && sourcePath && video.src.startsWith("http://127.0.0.1")) {
+    triedAssetFallback = true;
+    video.src = convertFileSrc(sourcePath);
+    video.load();
+    return;
+  }
+  if (source === "fastseek") {
+    // Fast-seek copy didn't work out; go back to what we had.
+    fastSeekState = "failed";
+    setSeekStatus("");
+    return;
+  }
+  if (source !== "transcode") void buildPreview("transcode");
   else showStageMsg("Could not play the preview, but you can still set cut points by time.");
 }
 
-async function makeProxy(): Promise<void> {
+// --- fast-seek preview ------------------------------------------------------
+function setSeekStatus(text: string, ready = false): void {
+  const el = $("seek-status");
+  el.hidden = !text;
+  el.textContent = text;
+  el.classList.toggle("ready", ready);
+}
+
+/** Called after each seek with how long it took. */
+function noteSeekTime(ms: number): void {
+  if (!media?.hasVideo || !settings.fastSeek || fastSeekState !== "idle") return;
+  if (source === "transcode" || source === "fastseek") return; // already short-GOP
+  seekSamples.push(ms);
+  if (seekSamples.length > 6) seekSamples.shift();
+  if (seekSamples.length >= 3 && median(seekSamples) > 220) void buildFastSeek();
+}
+
+async function buildFastSeek(): Promise<void> {
   if (!media) return;
   const token = loadToken;
-  usingProxy = true;
-  showStageMsg("This format can't be previewed directly — creating a preview copy…", 0);
+  fastSeekState = "building";
+  setSeekStatus("Seeking is slow on this file — building a fast-seek preview… 0%");
   try {
-    const p = await invoke<string>("make_proxy", {
-      path: media.path, ffmpegDir: settings.ffmpegDir, duration: media.duration,
+    const res = await invoke<{ url: string; path: string }>("make_preview", {
+      path: media.path, mode: "transcode", hevc: false, kind: "fastseek",
+      ffmpegDir: settings.ffmpegDir, duration: media.duration,
     });
     if (token !== loadToken) return;
-    showStageMsg("Loading preview…");
-    video.src = convertFileSrc(p);
-    video.load();
+    const wasPlaying = !video.paused;
+    fastSeekState = "ready";
+    setSource(res.url, "fastseek", res.path);
+    if (wasPlaying) video.addEventListener("loadedmetadata", () => void video.play(), { once: true });
+    setSeekStatus("Fast seeking on", true);
+    window.setTimeout(() => { if (fastSeekState === "ready") setSeekStatus(""); }, 4000);
   } catch (e) {
-    if (token !== loadToken || String(e) === "Cancelled") return;
-    showStageMsg(`Preview failed: ${e}`);
+    if (token !== loadToken) return;
+    fastSeekState = "failed";
+    setSeekStatus(String(e) === "Cancelled" ? "" : "Couldn't build fast-seek preview");
   }
 }
 
@@ -249,10 +394,44 @@ async function makeProxy(): Promise<void> {
 // ---------------------------------------------------------------------------
 function seek(t: number): void {
   if (!media) return;
+  stopAt = null;
   curTime = Math.min(Math.max(0, t), media.duration);
-  if (videoReady()) video.currentTime = curTime;
+  applySeek(curTime);
   followPlayhead();
   dirty = true;
+}
+
+/**
+ * Seeks are coalesced: while the decoder is still busy with one seek, only the
+ * latest requested position is remembered and applied when it finishes. Firing
+ * a new seek on every mouse move makes the decoder restart constantly, which is
+ * what made scrubbing feel laggy.
+ */
+function applySeek(t: number): void {
+  if (!videoReady()) return;
+  if (video.seeking) {
+    seekQueued = t;
+    return;
+  }
+  seekStartedAt = performance.now();
+  video.currentTime = t;
+}
+
+function onSeeked(): void {
+  if (seekStartedAt) {
+    const ms = performance.now() - seekStartedAt;
+    seekStartedAt = 0;
+    if (seekQueued === null) noteSeekTime(ms);
+  }
+  if (seekQueued !== null) {
+    const t = seekQueued;
+    seekQueued = null;
+    if (Math.abs(t - video.currentTime) > 0.0005) {
+      applySeek(t);
+      return;
+    }
+  }
+  if (video.paused) dirty = true;
 }
 
 function togglePlay(): void {
@@ -261,6 +440,16 @@ function togglePlay(): void {
     if (video.ended || curTime >= media.duration - 0.01) seek(inPt);
     void video.play();
   } else video.pause();
+}
+
+/** When set, playback stops here (used by "Play cut"). */
+let stopAt: number | null = null;
+
+function playCut(): void {
+  if (!media || !videoReady()) return;
+  seek(inPt);
+  stopAt = outPt;
+  void video.play();
 }
 
 function step(frames: number): void {
@@ -471,6 +660,12 @@ function setZoom(z: number, anchorT = curTime, anchorFrac = 0.5): void {
 function loop(): void {
   if (media && !video.paused) {
     curTime = video.currentTime;
+    if (stopAt !== null && curTime >= stopAt) {
+      video.pause();
+      curTime = stopAt;
+      video.currentTime = stopAt;
+      stopAt = null;
+    }
     followPlayhead();
     dirty = true;
   }
@@ -491,7 +686,8 @@ function showScreen(name: "editor" | "config"): void {
 }
 
 const isConfig = (): boolean => !$("config").hidden;
-const modalOpen = (): boolean => !$("settings-modal").hidden || !$("export-modal").hidden;
+const modalOpen = (): boolean =>
+  !$("settings-modal").hidden || !$("export-modal").hidden || !$("setup").hidden || !$("preview-modal").hidden;
 
 // ---------------------------------------------------------------------------
 // Config (export settings) screen
@@ -501,7 +697,7 @@ function goToConfig(): void {
   video.pause();
   const key = `${media.path}|${inPt}|${outPt}`;
   if (!cfg.nameEdited || cfg.nameKey !== key) {
-    cfg.filename = applyTemplate(settings.filenameTemplate, templateVars(media.path, inPt, outPt));
+    cfg.filename = defaultFilename();
     cfg.nameEdited = false;
   }
   cfg.nameKey = key;
@@ -513,10 +709,11 @@ function goToConfig(): void {
 function fillConfig(): void {
   if (!media) return;
   const { base, dir } = splitPath(media.path);
+  const dest = destinationDir();
   $("cfg-summary").textContent =
     `${base} · ${formatTime(inPt)} → ${formatTime(outPt)} (${formatDuration(outPt - inPt)})`;
   $<HTMLInputElement>("cfg-filename").value = cfg.filename;
-  $("cfg-folder").textContent = `Saved next to the original, in: ${dir}`;
+  $("cfg-folder").textContent = dest === dir ? `Saved next to the original, in: ${dir}` : `Saved to: ${dest}`;
 
   $("video-card").hidden = !media.hasVideo;
   $<HTMLInputElement>("cfg-bitrate").value = String(cfg.videoBitrate);
@@ -544,18 +741,40 @@ function renderAudioList(): void {
     list.innerHTML = `<div class="empty">This file has no audio tracks.</div>`;
     return;
   }
+  const plan = audioPlan();
+  if (!cfg.masterNameEdited) cfg.masterName = defaultMasterName();
   const roles: [TrackRole, string][] = [["master", "Master"], ["separate", "Keep"], ["remove", "Remove"]];
-  list.innerHTML = media.audio.map((t) => {
+  const masterLabel = plan.master.length > 1 ? `Master (Tracks ${plan.master.map((i) => i + 1).join(" + ")})` : `Track ${(plan.master[0] ?? 0) + 1}`;
+  const masterRow = plan.master.length ? `<label class="master-name">
+      <span>${plan.master.length > 1 ? "Master track name" : "Master track name"}</span>
+      <input id="master-name" type="text" spellcheck="false" value="${esc(cfg.masterName)}" placeholder="${esc(masterLabel)}" />
+    </label>` : "";
+  list.innerHTML = masterRow + media.audio.map((t) => {
     const desc = [t.codec.toUpperCase(), t.layout || (t.channels ? `${t.channels} ch` : ""),
       t.bitrate ? `${t.bitrate} kbps` : "", t.lang].filter(Boolean).join(" · ");
+    const out = t.role === "separate"
+      ? `<input class="track-name" data-i="${t.index}" type="text" spellcheck="false" value="${esc(t.outName)}" placeholder="Track ${t.index + 1}" title="Name of this track in the exported file" />`
+      : t.role === "master" ? `<span class="muted small-note">mixed into Master</span>` : "";
     return `<div class="track ${t.role}" data-i="${t.index}">
       <div class="num">${t.index + 1}</div>
       <div class="meta"><div class="t">${esc(t.title || `Track ${t.index + 1}`)}</div><div class="d">${esc(desc)}</div></div>
+      <div class="out">${out}</div>
       <div class="seg">${roles.map(([r, label]) =>
         `<button data-role="${r}" class="${t.role === r ? "on" : ""}">${label}</button>`).join("")}</div>
     </div>`;
   }).join("");
 }
+
+$("audio-list").addEventListener("input", (e) => {
+  const el = e.target as HTMLInputElement;
+  if (!media) return;
+  if (el.id === "master-name") {
+    cfg.masterName = el.value;
+    cfg.masterNameEdited = true;
+  } else if (el.classList.contains("track-name")) {
+    media.audio[Number(el.dataset.i)].outName = el.value;
+  }
+});
 
 $("audio-list").addEventListener("click", (e) => {
   const btn = (e.target as HTMLElement).closest<HTMLButtonElement>("button[data-role]");
@@ -663,9 +882,13 @@ function bindConfigInputs(): void {
     overwriteConfirmedFor = "";
     updateConfigUI();
   });
+  $("btn-change-folder").addEventListener("click", async () => {
+    const dir = await invoke<string | null>("pick_folder", { title: "Save this export to…" });
+    if (dir) { cfg.outputDir = dir; overwriteConfirmedFor = ""; fillConfig(); }
+  });
   $("btn-reset-name").addEventListener("click", () => {
     if (!media) return;
-    cfg.filename = applyTemplate(settings.filenameTemplate, templateVars(media.path, inPt, outPt));
+    cfg.filename = defaultFilename();
     cfg.nameEdited = false;
     $<HTMLInputElement>("cfg-filename").value = cfg.filename;
     updateConfigUI();
@@ -683,8 +906,10 @@ async function startExport(): Promise<void> {
   if (/[\\/:*?"<>|]/.test(name)) return err('File names can\'t contain \\ / : * ? " < > |');
   if (splitPath(name).ext.toLowerCase() === ".webm") return err("Use .mp4 or .mkv — .webm isn't supported with these encoders.");
 
-  const { dir, sep } = splitPath(media.path);
-  const output = dir ? `${dir}${sep}${name}` : name;
+  const dest = destinationDir();
+  if (dest !== splitPath(media.path).dir && !(await invoke<boolean>("path_exists", { path: dest })))
+    return err(`The output folder doesn't exist: ${dest}. Change it in Settings or with "Change…".`);
+  const output = joinPath(dest, name);
   if (output.toLowerCase() === media.path.toLowerCase())
     return err("The output name is the same as the original file. Change it so the original isn't overwritten.");
 
@@ -712,7 +937,7 @@ async function startExport(): Promise<void> {
       scaleHeight: cfg.resolution === "orig" ? null : Number(cfg.resolution),
       sizeMode: cfg.mode === "size",
     } : null,
-    audio: { master: plan.master, separate: plan.separate, bitrateKbps: cfg.audioBitrate },
+    audio: { master: plan.master, separate: plan.separate, bitrateKbps: cfg.audioBitrate, titles: outputTitles() },
   };
 
   exporting = true;
@@ -761,6 +986,159 @@ function onExportProgress(p: Progress): void {
 }
 
 // ---------------------------------------------------------------------------
+// Cut preview ("Preview" on the export screen)
+// A muted low-res video plus one <audio> per output track. All audio elements
+// play together and stay locked to one clock; the checkboxes only mute/unmute,
+// so switching tracks is instant and several can be heard at once.
+// ---------------------------------------------------------------------------
+const pvVideo = $<HTMLVideoElement>("pv-video");
+let pvAudios: HTMLAudioElement[] = [];
+let pvToken = 0;
+let pvDuration = 0;
+
+const pvClock = (): HTMLMediaElement | null => (media?.hasVideo ? pvVideo : pvAudios[0] ?? null);
+const pvAll = (): HTMLMediaElement[] => [...(media?.hasVideo ? [pvVideo] : []), ...pvAudios];
+
+async function openCutPreview(): Promise<void> {
+  if (!media) return;
+  const plan = audioPlan();
+  if (!media.hasVideo && !plan.outTracks) {
+    $("cfg-error").textContent = "Nothing to preview — select at least one audio track.";
+    return;
+  }
+  closeCutPreview(false);
+  const token = ++pvToken;
+  $("preview-modal").hidden = false;
+  $("pv-sub").textContent = `${formatTime(inPt)} → ${formatTime(outPt)} (${formatDuration(outPt - inPt)})`;
+  $("pv-loading").hidden = false;
+  $("pv-player").hidden = true;
+  $("pv-error").textContent = "";
+  $("pv-loading-text").textContent = "Rendering preview…";
+  $("pv-bar").style.width = "0%";
+  try {
+    const res = await invoke<CutPreviewResult>("render_cut_preview", {
+      req: {
+        input: media.path, start: inPt, end: outPt, hasVideo: media.hasVideo, ffmpegDir: settings.ffmpegDir,
+        audio: { master: plan.master, separate: plan.separate, bitrateKbps: cfg.audioBitrate, titles: outputTitles() },
+      },
+    });
+    if (token !== pvToken || $("preview-modal").hidden) return;
+    setupCutPlayer(res);
+  } catch (e) {
+    if (token !== pvToken || String(e) === "Cancelled") return;
+    $("pv-loading").hidden = true;
+    $("pv-error").textContent = String(e);
+  }
+}
+
+function setupCutPlayer(res: CutPreviewResult): void {
+  pvDuration = outPt - inPt;
+  const plan = audioPlan();
+  const labels: string[] = [];
+  if (plan.master.length) {
+    labels.push(cfg.masterName.trim() || (plan.master.length > 1
+      ? `Master (Tracks ${plan.master.map((i) => i + 1).join(" + ")})` : `Track ${plan.master[0] + 1}`));
+  }
+  for (const i of plan.separate) labels.push(media!.audio[i].outName.trim() || `Track ${i + 1}`);
+
+  pvAudios = res.audioUrls.map((url, i) => {
+    const a = new Audio(url);
+    a.preload = "auto";
+    a.muted = i !== 0; // first output track (what players play by default) is on
+    $("pv-audio-holder").appendChild(a);
+    return a;
+  });
+  $("pv-tracks").innerHTML = labels.length
+    ? labels.map((l, i) => `<label class="${i === 0 ? "on" : ""}"><input type="checkbox" data-i="${i}" ${i === 0 ? "checked" : ""}/> ${esc(l)}</label>`).join("")
+    : `<span class="muted">No audio tracks selected.</span>`;
+  $("pv-video").parentElement!.hidden = !media?.hasVideo;
+  if (res.videoUrl) { pvVideo.src = res.videoUrl; pvVideo.load(); }
+
+  $("pv-loading").hidden = true;
+  $("pv-player").hidden = false;
+  pvRender();
+  const clock = pvClock();
+  clock?.addEventListener("canplay", () => pvPlay(), { once: true });
+}
+
+function pvPlay(): void {
+  const clock = pvClock();
+  if (!clock) return;
+  if (clock.ended || clock.currentTime >= pvDuration - 0.05) pvSeek(0);
+  for (const a of pvAudios) a.currentTime = clock.currentTime;
+  for (const m of pvAll()) void m.play().catch(() => {});
+}
+
+function pvPause(): void {
+  for (const m of pvAll()) m.pause();
+}
+
+function pvToggle(): void {
+  const c = pvClock();
+  if (!c) return;
+  if (c.paused) pvPlay(); else pvPause();
+}
+
+function pvSeek(t: number): void {
+  for (const m of pvAll()) m.currentTime = Math.min(Math.max(0, t), pvDuration);
+  pvRender();
+}
+
+/** Keep audio locked to the clock and update the controls. */
+function pvTick(): void {
+  if ($("preview-modal").hidden) return;
+  const c = pvClock();
+  if (c && !c.paused) {
+    for (const a of pvAudios) {
+      if (a === c) continue;
+      if (Math.abs(a.currentTime - c.currentTime) > 0.08) a.currentTime = c.currentTime;
+      if (a.paused && !a.ended) void a.play().catch(() => {});
+    }
+    if (c.currentTime >= pvDuration - 0.02 || c.ended) pvPause();
+  }
+  pvRender();
+  requestAnimationFrame(pvTick);
+}
+
+function pvRender(): void {
+  const c = pvClock();
+  const t = c?.currentTime ?? 0;
+  $<HTMLInputElement>("pv-seek").value = String(pvDuration ? Math.round((t / pvDuration) * 1000) : 0);
+  $("pv-time").textContent = `${formatDuration(t)} / ${formatDuration(pvDuration)}`;
+  $("pv-play-icon").innerHTML = `<use href="#i-${c && !c.paused ? "pause" : "play"}"/>`;
+}
+
+function closeCutPreview(hide = true): void {
+  pvToken++;
+  void invoke("cancel_job", { kind: "cutpreview" }).catch(() => {});
+  pvPause();
+  pvVideo.removeAttribute("src");
+  pvVideo.load();
+  for (const a of pvAudios) { a.removeAttribute("src"); a.load(); a.remove(); }
+  pvAudios = [];
+  if (hide) $("preview-modal").hidden = true;
+}
+
+function bindCutPreview(): void {
+  $("pv-close").addEventListener("click", () => closeCutPreview());
+  $("pv-play").addEventListener("click", pvToggle);
+  pvVideo.addEventListener("click", pvToggle);
+  $<HTMLInputElement>("pv-seek").addEventListener("input", (e) => {
+    pvSeek((Number((e.target as HTMLInputElement).value) / 1000) * pvDuration);
+  });
+  $("pv-tracks").addEventListener("change", (e) => {
+    const cb = e.target as HTMLInputElement;
+    const a = pvAudios[Number(cb.dataset.i)];
+    if (!a) return;
+    a.muted = !cb.checked;
+    cb.parentElement!.classList.toggle("on", cb.checked);
+  });
+  $("preview-modal").addEventListener("click", (e) => { if (e.target === e.currentTarget) closeCutPreview(); });
+  new MutationObserver(() => { if (!$("preview-modal").hidden) requestAnimationFrame(pvTick); })
+    .observe($("preview-modal"), { attributes: true, attributeFilter: ["hidden"] });
+}
+
+// ---------------------------------------------------------------------------
 // Settings modal
 // ---------------------------------------------------------------------------
 function openSettings(): void {
@@ -773,19 +1151,58 @@ function openSettings(): void {
   $<HTMLSelectElement>("set-encoder").value = settings.encoder;
   $<HTMLSelectElement>("set-preset").value = settings.preset;
   $<HTMLInputElement>("set-twopass").checked = settings.twoPass;
+  $<HTMLInputElement>(settings.outputLocation === "folder" ? "set-loc-folder" : "set-loc-source").checked = true;
+  $<HTMLInputElement>("set-outdir").value = settings.outputFolder;
+  $<HTMLSelectElement>("set-format").value = settings.outputFormat;
+  $<HTMLInputElement>("set-fastseek").checked = settings.fastSeek;
+  $<HTMLInputElement>("set-master-name").value = settings.masterTrackName;
+  renderTrackNameInputs(settings.trackNames);
   $("ff-test-result").textContent = "";
+  syncLocationRow();
   updateTemplatePreview();
+  void refreshFfmpegStatusLine();
   $("settings-modal").hidden = false;
   $<HTMLInputElement>("set-template").focus();
 }
 
+/** Settings rows "Track 1 [name]" … — at least 4, or as many as the open file has. */
+function renderTrackNameInputs(names: string[]): void {
+  const n = Math.max(4, names.length, media?.audio.length ?? 0);
+  $("set-track-names").innerHTML = Array.from({ length: n }, (_, i) => `<label class="tn-row">
+      <span>Track ${i + 1}</span>
+      <input type="text" spellcheck="false" data-i="${i}" value="${esc(names[i] ?? "")}" placeholder="${i === 0 ? "e.g. Game" : i === 1 ? "e.g. Discord" : i === 2 ? "e.g. Microphone" : "(keep file's name)"}" />
+    </label>`).join("");
+}
+
+function readTrackNameInputs(): string[] {
+  const names = [...document.querySelectorAll<HTMLInputElement>("#set-track-names input")].map((i) => i.value.trim());
+  while (names.length && !names[names.length - 1]) names.pop();
+  return names;
+}
+
+function syncLocationRow(): void {
+  const folder = $<HTMLInputElement>("set-loc-folder").checked;
+  $("set-outdir").closest(".row")!.classList.toggle("disabled", !folder);
+}
+
+async function refreshFfmpegStatusLine(): Promise<void> {
+  const el = $("ff-status-line");
+  el.textContent = "Checking FFmpeg…";
+  const s = await invoke<FfmpegStatus>("ffmpeg_status", { ffmpegDir: settings.ffmpegDir });
+  const from = { settings: "custom folder", managed: "installed by Media Compressor", bundled: "next to the app", path: "from PATH", "": "" }[s.source];
+  el.textContent = s.ok ? `Using ${s.version.replace(/ Copyright.*$/, "")} (${from})` : "FFmpeg not found.";
+  $("btn-reinstall-ff").hidden = !s.canAutoInstall;
+}
+
 function updateTemplatePreview(): void {
   const tpl = $<HTMLInputElement>("set-template").value;
-  const vars = media ? templateVars(media.path, inPt, outPt) : templateVars("C:\\Videos\\My Clip.mp4", 65.25, 130);
+  const format = $<HTMLSelectElement>("set-format").value as OutputFormat;
+  const vars = media ? templateVars(media.path, inPt, outPt, format) : templateVars("C:\\Videos\\My Clip.mp4", 65.25, 130, format);
   $("set-template-preview").textContent = applyTemplate(tpl, vars);
 }
 
 async function saveSettings(): Promise<void> {
+  const previous = settings;
   const num = (id: string, fallback: number): number => parseFloat($<HTMLInputElement>(id).value) || fallback;
   settings = {
     filenameTemplate: $<HTMLInputElement>("set-template").value.trim() || DEFAULT_SETTINGS.filenameTemplate,
@@ -797,7 +1214,19 @@ async function saveSettings(): Promise<void> {
     encoder: $<HTMLSelectElement>("set-encoder").value as Encoder,
     preset: $<HTMLSelectElement>("set-preset").value,
     twoPass: $<HTMLInputElement>("set-twopass").checked,
+    outputLocation: ($<HTMLInputElement>("set-loc-folder").checked ? "folder" : "source") as OutputLocation,
+    outputFolder: $<HTMLInputElement>("set-outdir").value.trim(),
+    outputFormat: $<HTMLSelectElement>("set-format").value as OutputFormat,
+    fastSeek: $<HTMLInputElement>("set-fastseek").checked,
+    masterTrackName: $<HTMLInputElement>("set-master-name").value.trim(),
+    trackNames: readTrackNameInputs(),
   };
+  if (settings.outputLocation === "folder") {
+    if (!settings.outputFolder) { toast("Choose a folder to save to, or pick \"Same folder as the input file\".", true); return; }
+    if (!(await invoke<boolean>("path_exists", { path: settings.outputFolder }))) {
+      toast(`That folder doesn't exist: ${settings.outputFolder}`, true); return;
+    }
+  }
   try {
     await invoke("save_settings", { settings });
   } catch (e) {
@@ -805,9 +1234,15 @@ async function saveSettings(): Promise<void> {
   }
   // Apply new defaults to the current export (keep the user's edited filename & track roles).
   const keepName = cfg.nameEdited ? { filename: cfg.filename, nameKey: cfg.nameKey, nameEdited: true } : {};
-  cfg = { ...freshConfig(), resolution: cfg.resolution, ...keepName };
+  const keepMaster = cfg.masterNameEdited ? { masterName: cfg.masterName, masterNameEdited: true } : {};
+  cfg = { ...freshConfig(), resolution: cfg.resolution, outputDir: cfg.outputDir, ...keepName, ...keepMaster };
+  // New default track names apply to tracks whose name the user hasn't changed.
+  for (const t of media?.audio ?? []) {
+    const oldDefault = previous.trackNames[t.index]?.trim() || t.title || "";
+    if (!t.outName.trim() || t.outName === oldDefault) t.outName = defaultTrackName(t);
+  }
   if (isConfig()) {
-    if (!cfg.nameEdited && media) cfg.filename = applyTemplate(settings.filenameTemplate, templateVars(media.path, inPt, outPt));
+    if (!cfg.nameEdited && media) cfg.filename = defaultFilename();
     fillConfig();
   }
   $("settings-modal").hidden = true;
@@ -839,6 +1274,25 @@ function bindSettings(): void {
     }
   });
   $("btn-set-save").addEventListener("click", () => void saveSettings());
+  for (const id of ["set-loc-source", "set-loc-folder"]) $(id).addEventListener("change", syncLocationRow);
+  $("set-format").addEventListener("change", updateTemplatePreview);
+  $("btn-browse-outdir").addEventListener("click", async () => {
+    const dir = await invoke<string | null>("pick_folder", { title: "Save exports to…" });
+    if (dir) {
+      $<HTMLInputElement>("set-outdir").value = dir;
+      $<HTMLInputElement>("set-loc-folder").checked = true;
+      syncLocationRow();
+    }
+  });
+  $("btn-add-track-name").addEventListener("click", () => {
+    const cur = [...document.querySelectorAll<HTMLInputElement>("#set-track-names input")].map((i) => i.value);
+    renderTrackNameInputs([...cur, ""]);
+    ($("set-track-names").lastElementChild?.querySelector("input") as HTMLInputElement | null)?.focus();
+  });
+  $("btn-reinstall-ff").addEventListener("click", () => {
+    $("settings-modal").hidden = true;
+    void runSetup(true);
+  });
   $("btn-set-cancel").addEventListener("click", () => ($("settings-modal").hidden = true));
 }
 
@@ -851,10 +1305,12 @@ window.addEventListener("keydown", (e) => {
 
   if (e.key === "Escape") {
     if (!$("settings-modal").hidden) { $("settings-modal").hidden = true; return; }
+    if (!$("preview-modal").hidden) { closeCutPreview(); return; }
     if (typing) { target.blur(); return; }
     if (isConfig() && !modalOpen()) { showScreen("editor"); return; }
   }
   if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "o") { e.preventDefault(); void browse(); return; }
+  if (!$("preview-modal").hidden && e.key === " " && !typing) { e.preventDefault(); pvToggle(); return; }
   if (typing || modalOpen() || isConfig() || !media) return;
 
   const k = e.key;
@@ -871,6 +1327,7 @@ window.addEventListener("keydown", (e) => {
     case "Home": seek(0); break;
     case "End": seek(media.duration); break;
     case "m": case "M": toggleMute(); break;
+    case "p": case "P": playCut(); break;
     case "Enter": goToConfig(); break;
     default: handled = false;
   }
@@ -906,6 +1363,9 @@ function bind(): void {
   $("btn-goto-in").addEventListener("click", () => seek(inPt));
   $("btn-goto-out").addEventListener("click", () => seek(outPt));
   $("btn-mute").addEventListener("click", toggleMute);
+  $("btn-play-cut").addEventListener("click", playCut);
+  $("btn-preview").addEventListener("click", () => void openCutPreview());
+  bindCutPreview();
   $("btn-to-config").addEventListener("click", goToConfig);
   $("btn-back").addEventListener("click", () => showScreen("editor"));
   $("btn-export").addEventListener("click", () => void startExport());
@@ -925,7 +1385,7 @@ function bind(): void {
   video.addEventListener("error", onVideoError);
   video.addEventListener("play", () => ($("play-icon").innerHTML = `<use href="#i-pause"/>`));
   video.addEventListener("pause", () => ($("play-icon").innerHTML = `<use href="#i-play"/>`));
-  video.addEventListener("seeked", () => { if (video.paused) { curTime = video.currentTime; dirty = true; } });
+  video.addEventListener("seeked", onSeeked);
   video.addEventListener("click", togglePlay);
 
   $("btn-exp-cancel").addEventListener("click", () => void invoke("cancel_job", { kind: "export" }));
@@ -946,6 +1406,129 @@ function bind(): void {
   window.addEventListener("resize", () => (dirty = true));
 }
 
+// ---------------------------------------------------------------------------
+// First-run setup: make sure FFmpeg is available, download it if not
+// ---------------------------------------------------------------------------
+const MIN_FFMPEG_MAJOR = 5;
+let setupResolve: (() => void) | null = null;
+
+function setupUI(o: {
+  title?: string; text?: string; progress?: number | null; detail?: string; error?: string;
+  buttons?: ("cancel" | "folder" | "retry")[];
+}): void {
+  $("setup").hidden = false;
+  if (o.title !== undefined) $("setup-title").textContent = o.title;
+  if (o.text !== undefined) $("setup-text").textContent = o.text;
+  if (o.progress !== undefined) {
+    $("setup-barwrap").hidden = o.progress === null;
+    $("setup-bar").style.width = `${((o.progress ?? 0) * 100).toFixed(1)}%`;
+    $("setup-pct").textContent = o.progress === null ? "" : `${Math.floor((o.progress ?? 0) * 100)}%`;
+  }
+  if (o.detail !== undefined) $("setup-detail").textContent = o.detail;
+  if (o.error !== undefined) $("setup-error").textContent = o.error;
+  const b = o.buttons ?? [];
+  $("setup-cancel").hidden = !b.includes("cancel");
+  $("setup-folder").hidden = !b.includes("folder");
+  $("setup-retry").hidden = !b.includes("retry");
+}
+
+const ffVersion = (s: FfmpegStatus): string => s.version.replace(/^ffmpeg version\s+/, "").split(/\s/)[0];
+
+/**
+ * Check for FFmpeg; if it's missing (or too old) download it automatically.
+ * Resolves once a usable FFmpeg is available. `forceInstall` re-downloads.
+ */
+async function runSetup(forceInstall = false): Promise<void> {
+  const status = await invoke<FfmpegStatus>("ffmpeg_status", { ffmpegDir: settings.ffmpegDir });
+  const tooOld = status.ok && status.major !== null && status.major < MIN_FFMPEG_MAJOR;
+  if (status.ok && !tooOld && !forceInstall) {
+    $("setup").hidden = true;
+    return;
+  }
+
+  await new Promise<void>((resolve) => {
+    setupResolve = resolve;
+    if (!status.canAutoInstall) {
+      setupUI({
+        title: "FFmpeg is needed",
+        text: "Media Compressor uses FFmpeg to read and export video, and it couldn't find it. "
+          + "Install it with your package manager (macOS: brew install ffmpeg · Linux: sudo apt install ffmpeg), then click Try again.",
+        progress: null, detail: "", error: status.error, buttons: ["folder", "retry"],
+      });
+      return;
+    }
+    void doInstall(tooOld ? `Found FFmpeg ${ffVersion(status)}, but version ${MIN_FFMPEG_MAJOR} or newer is needed.` : "");
+  });
+  setupResolve = null;
+}
+
+async function doInstall(prefix = ""): Promise<void> {
+  setupUI({
+    title: "Installing FFmpeg",
+    text: `${prefix ? prefix + " " : ""}Media Compressor uses FFmpeg to read and export video. `
+      + "Downloading it now — this only happens once (about 190 MB, from the official FFmpeg builds on GitHub).",
+    progress: 0, detail: "Connecting…", error: "", buttons: ["cancel"],
+  });
+  try {
+    const version = await invoke<string>("install_ffmpeg");
+    // A previously set custom folder would take priority over the new install.
+    if (settings.ffmpegDir) {
+      settings.ffmpegDir = "";
+      await invoke("save_settings", { settings }).catch(() => {});
+    }
+    setupUI({ title: "FFmpeg is ready", text: version.replace(/ Copyright.*$/, ""), progress: 1, detail: "", buttons: [] });
+    window.setTimeout(() => { $("setup").hidden = true; setupResolve?.(); }, 900);
+  } catch (e) {
+    const cancelled = String(e) === "Cancelled";
+    setupUI({
+      title: cancelled ? "Download cancelled" : "Couldn't install FFmpeg",
+      text: cancelled ? "FFmpeg is needed to open videos." : "Check your internet connection and try again, or point Media Compressor at an FFmpeg you already have.",
+      progress: null, detail: "", error: cancelled ? "" : String(e), buttons: ["folder", "retry"],
+    });
+  }
+}
+
+function onInstallProgress(p: InstallProgress): void {
+  if (p.stage === "download") {
+    const mb = (n: number): string => (n / 1048576).toFixed(1);
+    setupUI({
+      progress: p.total ? p.done / p.total : null,
+      detail: p.total ? `${mb(p.done)} MB of ${mb(p.total)} MB` : `${mb(p.done)} MB`,
+    });
+  } else {
+    setupUI({ progress: 1, detail: p.stage === "verify" ? "Verifying download…" : "Extracting…", buttons: [] });
+  }
+}
+
+function bindSetup(): void {
+  $("setup-cancel").addEventListener("click", () => void invoke("cancel_install"));
+  $("setup-retry").addEventListener("click", async () => {
+    const s = await invoke<FfmpegStatus>("ffmpeg_status", { ffmpegDir: settings.ffmpegDir });
+    if (s.ok && (s.major === null || s.major >= MIN_FFMPEG_MAJOR)) {
+      $("setup").hidden = true;
+      setupResolve?.();
+    } else if (s.canAutoInstall) {
+      void doInstall();
+    } else {
+      setupUI({ error: s.error || "Still not found." });
+    }
+  });
+  $("setup-folder").addEventListener("click", async () => {
+    const dir = await invoke<string | null>("pick_folder", { title: "Choose the folder that contains ffmpeg" });
+    if (!dir) return;
+    const s = await invoke<FfmpegStatus>("ffmpeg_status", { ffmpegDir: dir });
+    if (!s.ok) {
+      setupUI({ error: `ffmpeg and ffprobe weren't found in ${dir}.\n${s.error}` });
+      return;
+    }
+    settings.ffmpegDir = dir;
+    await invoke("save_settings", { settings }).catch(() => {});
+    $("setup").hidden = true;
+    setupResolve?.();
+    toast(`Using FFmpeg ${ffVersion(s)}`);
+  });
+}
+
 async function init(): Promise<void> {
   bind();
   requestAnimationFrame(loop);
@@ -955,12 +1538,24 @@ async function init(): Promise<void> {
     if (saved && typeof saved === "object") settings = { ...DEFAULT_SETTINGS, ...saved };
   } catch { /* first run */ }
   cfg = freshConfig();
+  bindSetup();
 
   await listen<Progress>("export-progress", (e) => onExportProgress(e.payload));
-  await listen<Progress>("proxy-progress", (e) => {
-    if (usingProxy && !$("stage-msg").hidden && e.payload.fraction < 1)
-      showStageMsg("This format can't be previewed directly — creating a preview copy…", e.payload.fraction);
+  await listen<Progress>("preview-progress", (e) => {
+    if (!$("stage-msg").hidden && e.payload.fraction < 1)
+      showStageMsg($("stage-msg-text").textContent ?? "", e.payload.fraction);
   });
+  await listen<Progress>("fastseek-progress", (e) => {
+    if (fastSeekState === "building")
+      setSeekStatus(`Seeking is slow on this file — building a fast-seek preview… ${Math.floor(e.payload.fraction * 100)}%`);
+  });
+  await listen<InstallProgress>("ffmpeg-install-progress", (e) => onInstallProgress(e.payload));
+  await listen<Progress>("cutpreview-progress", (e) => {
+    $("pv-bar").style.width = `${(e.payload.fraction * 100).toFixed(1)}%`;
+    $("pv-loading-text").textContent = `Rendering preview… ${Math.floor(e.payload.fraction * 100)}%`;
+  });
+
+  await runSetup();
 
   await getCurrentWebview().onDragDropEvent((e) => {
     const dz = $("dropzone");
