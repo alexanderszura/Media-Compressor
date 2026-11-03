@@ -266,6 +266,13 @@
         <div class="hint" id="ff-test-result"></div>
         <button id="btn-reinstall-ff" class="ghost small">Download latest FFmpeg</button>
 
+        <h2>Updates</h2>
+        <label class="check"><input type="checkbox" id="set-autoupdate" /> Check for updates when the app starts</label>
+        <div class="row-inline">
+          <span class="hint" id="app-version"></span>
+          <button id="btn-check-updates" class="ghost small">Check for updates now</button>
+        </div>
+
         <h2>Defaults for new exports</h2>
         <div class="grid2">
           <label class="field"><span>Mode</span>
@@ -352,6 +359,25 @@
         </div>
         <div id="pv-error" class="error-text pre"></div>
         <div id="pv-audio-holder" hidden></div>
+      </div>
+    </div>
+
+    <!-- ============ UPDATE PROMPT ============ -->
+    <div id="update-modal" class="modal" hidden>
+      <div class="modal-card narrow">
+        <h1 id="up-title">Update available</h1>
+        <p id="up-text" class="muted"></p>
+        <div id="up-notes" class="up-notes" hidden></div>
+        <div id="up-progress" hidden>
+          <div class="bar big"><div id="up-bar"></div></div>
+          <div class="exp-stats"><span id="up-detail"></span><span id="up-pct"></span></div>
+        </div>
+        <div id="up-error" class="error-text pre"></div>
+        <div class="modal-actions" id="up-actions">
+          <button id="up-skip" class="ghost">Skip this version</button>
+          <button id="up-later" class="ghost">Later</button>
+          <button id="up-install" class="primary">Update now</button>
+        </div>
       </div>
     </div>
 

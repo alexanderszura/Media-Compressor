@@ -20,6 +20,10 @@ ureq = { version = "2", default-features = false, features = ["tls", "native-cer
 zip = { version = "2", default-features = false, features = ["deflate"] }
 sha2 = "0.10"
 
+[target.'cfg(not(any(target_os = "android", target_os = "ios")))'.dependencies]
+tauri-plugin-updater = "2"
+tauri-plugin-process = "2"
+
 [profile.release]
 codegen-units = 1
 lto = true

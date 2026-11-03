@@ -773,6 +773,8 @@ pub fn run() {
     let server = MediaServer::start().expect("could not start local media server");
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_updater::Builder::new().build())
+        .plugin(tauri_plugin_process::init())
         .manage(Jobs::default())
         .manage(server)
         .manage(Arc::new(InstallState::default()))

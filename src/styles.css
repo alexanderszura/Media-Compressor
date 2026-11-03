@@ -216,3 +216,9 @@ code { background: #1a1a1a; padding: 1px 5px; border-radius: 3px; font-family: C
 .pv-tracks label.on { border-color: var(--accent); background: #1d2a2e; }
 .pv-tracks input { accent-color: var(--accent); }
 .ghost.big { font-size: 16px; padding: 7px 18px; }
+
+/* ---------- updates ---------- */
+.row-inline { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+.row-inline .hint { margin: 0; }
+.up-notes { background: #1d1d1d; border: 1px solid #333; border-radius: 6px; padding: 10px 12px; max-height: 220px; overflow: auto; white-space: pre-wrap; font-size: 13px; margin: 8px 0 4px; }
+#up-text { margin: 0 0 6px; }

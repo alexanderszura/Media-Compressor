@@ -94,6 +94,55 @@ When you open a file, the app checks its codecs against what your WebView2 can p
 
 Preview copies are deleted when you open another file or close the app. **Exports always use the original file.**
 
+## Releases & auto-update
+
+`.github/workflows/publish.yml` builds the app every time you **publish a GitHub Release**, and uploads the installers to that release:
+
+| Platform | Files |
+| --- | --- |
+| Windows x64 | `.exe` (NSIS installer) and `.msi` |
+| macOS Apple Silicon and Intel | `.dmg` and `.app.tar.gz` |
+| Linux x64 | `.AppImage`, `.deb` and `.rpm` |
+
+The workflow also uploads `latest.json` and signature files. The app's built-in updater reads `latest.json` from `https://github.com/alexanderszura/Media-Compressor/releases/latest/download/latest.json`.
+
+### One-time setup
+
+1. Run these on your computer:
+   ```bash
+   npm install
+   npm run setup-updater
+   ```
+   This does three things:
+   - Creates an update-signing key in `~/.tauri/media-compressor.key`, outside the repo.
+   - Writes the matching public key into `src-tauri/tauri.conf.json`.
+   - If the [GitHub CLI](https://cli.github.com) is installed and logged in, stores the private key as repository secrets. Otherwise it prints the two secrets to add under **Settings → Secrets and variables → Actions**:
+     - `TAURI_SIGNING_PRIVATE_KEY`: the contents of the key file.
+     - `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`: leave this empty.
+2. Commit `src-tauri/tauri.conf.json` and push.
+3. **Back up the key file.** Installed copies of the app only accept updates signed with this key. If you lose it, users would have to reinstall manually once.
+
+### Making a release
+
+On GitHub, go to **Releases → Draft a new release**. Create a tag like `v0.2.0`, write the release notes (the update dialog shows them), and click **Publish**. The workflow takes the version number from the tag, so you never need to edit version numbers in files. The builds take about 10–15 minutes. You can also re-run a build for an existing tag from **Actions → publish → Run workflow**.
+
+### In the app
+
+- **Startup check.** A few seconds after the app starts, it checks for a new version. If one exists, it shows **Update now / Later / Skip this version**.
+- **Update now.** Downloads the update, verifies its signature against the key built into the app, installs it, and restarts. On Windows the installer runs in passive mode, showing a small progress window with no prompts.
+- **Settings → Updates.** Turn the automatic check on or off, or check right now.
+- **Dev mode.** `npm run tauri dev` never checks automatically.
+
+### Things to know
+
+- **The repository must be public.** The updater downloads release files without logging in.
+- **Unsigned builds trigger warnings.** The builds are not code-signed with a paid certificate:
+  - Windows SmartScreen will say "unrecognized app" on first install (click **More info → Run anyway**).
+  - macOS will block the app until you right-click it and choose **Open**, or allow it in **System Settings → Privacy & Security**.
+  - Updates themselves are still cryptographically verified.
+- **Linux updates.** Auto-update only works for the AppImage. `.deb` and `.rpm` installs update through the package manager or by reinstalling.
+- **Local builds.** `npm run tauri build` works without the signing key. Only CI builds produce update files.
+
 ## Notes
 
 - **Preview audio.** Only the default audio track plays during preview. All tracks are included in the export as configured.
@@ -113,4 +162,7 @@ src-tauri/src/lib.rs          Tauri commands: probe, export, previews, FFmpeg se
 src-tauri/src/ffmpeg.rs       Builds FFmpeg arguments for exports and previews (unit tested)
 src-tauri/src/media_server.rs Localhost HTTP server with byte-range support for the player
 src-tauri/src/installer.rs    Downloads, verifies and extracts FFmpeg
+src-tauri/tauri.release.conf.json  Extra config merged for CI release builds (updater artifacts)
+scripts/setup-updater.mjs     One-time updater key setup
+.github/workflows/publish.yml Release builds for Windows / macOS / Linux
 ```

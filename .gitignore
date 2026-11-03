@@ -4,3 +4,7 @@ src-tauri/target/
 src-tauri/gen/
 *.log
 .DS_Store
+
+# never commit updater signing keys
+*.key
+*.key.pub

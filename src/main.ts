@@ -1,6 +1,9 @@
 import { convertFileSrc, invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
+import { getVersion } from "@tauri-apps/api/app";
+import { check, type Update } from "@tauri-apps/plugin-updater";
+import { relaunch } from "@tauri-apps/plugin-process";
 import {
   applyTemplate, bitrateForTargetSize, estimateSizeMB, formatBytes, formatDuration, formatTime,
   joinPath, median, parseRate, parseTime, planPreview, splitPath, templateVars, TEMPLATE_VARS,
@@ -50,6 +53,8 @@ const DEFAULT_SETTINGS: Settings = {
   fastSeek: true,
   masterTrackName: "Master",
   trackNames: [],
+  autoUpdateCheck: true,
+  skippedVersion: "",
   mode: "bitrate",
   videoBitrate: 4000,
   targetSizeMB: 25,
@@ -687,7 +692,8 @@ function showScreen(name: "editor" | "config"): void {
 
 const isConfig = (): boolean => !$("config").hidden;
 const modalOpen = (): boolean =>
-  !$("settings-modal").hidden || !$("export-modal").hidden || !$("setup").hidden || !$("preview-modal").hidden;
+  !$("settings-modal").hidden || !$("export-modal").hidden || !$("setup").hidden || !$("preview-modal").hidden
+  || !$("update-modal").hidden;
 
 // ---------------------------------------------------------------------------
 // Config (export settings) screen
@@ -1156,6 +1162,8 @@ function openSettings(): void {
   $<HTMLSelectElement>("set-format").value = settings.outputFormat;
   $<HTMLInputElement>("set-fastseek").checked = settings.fastSeek;
   $<HTMLInputElement>("set-master-name").value = settings.masterTrackName;
+  $<HTMLInputElement>("set-autoupdate").checked = settings.autoUpdateCheck;
+  void getVersion().then((v) => ($("app-version").textContent = `You have version ${v}`)).catch(() => {});
   renderTrackNameInputs(settings.trackNames);
   $("ff-test-result").textContent = "";
   syncLocationRow();
@@ -1220,6 +1228,8 @@ async function saveSettings(): Promise<void> {
     fastSeek: $<HTMLInputElement>("set-fastseek").checked,
     masterTrackName: $<HTMLInputElement>("set-master-name").value.trim(),
     trackNames: readTrackNameInputs(),
+    autoUpdateCheck: $<HTMLInputElement>("set-autoupdate").checked,
+    skippedVersion: previous.skippedVersion,
   };
   if (settings.outputLocation === "folder") {
     if (!settings.outputFolder) { toast("Choose a folder to save to, or pick \"Same folder as the input file\".", true); return; }
@@ -1288,6 +1298,10 @@ function bindSettings(): void {
     const cur = [...document.querySelectorAll<HTMLInputElement>("#set-track-names input")].map((i) => i.value);
     renderTrackNameInputs([...cur, ""]);
     ($("set-track-names").lastElementChild?.querySelector("input") as HTMLInputElement | null)?.focus();
+  });
+  $("btn-check-updates").addEventListener("click", () => {
+    $("settings-modal").hidden = true;
+    void checkForUpdates(true);
   });
   $("btn-reinstall-ff").addEventListener("click", () => {
     $("settings-modal").hidden = true;
@@ -1404,6 +1418,98 @@ function bind(): void {
   bindConfigInputs();
   bindSettings();
   window.addEventListener("resize", () => (dirty = true));
+}
+
+// ---------------------------------------------------------------------------
+// App updates (GitHub Releases → latest.json, verified with the updater key)
+// ---------------------------------------------------------------------------
+let pendingUpdate: Update | null = null;
+
+async function checkForUpdates(manual: boolean): Promise<void> {
+  if (manual) toast("Checking for updates…");
+  try {
+    const update = await check({ timeout: 15000 });
+    if (!update) {
+      if (manual) toast(`You're on the latest version (${await getVersion()}).`);
+      return;
+    }
+    if (!manual && settings.skippedVersion === update.version) return;
+    showUpdatePrompt(update);
+  } catch (e) {
+    // No releases yet, offline, etc. Only bother the user if they asked.
+    if (manual) toast(`Couldn't check for updates: ${e}`, true);
+    else console.warn("update check failed", e);
+  }
+}
+
+function showUpdatePrompt(update: Update): void {
+  pendingUpdate = update;
+  $("toast").hidden = true;
+  $("up-title").textContent = "Update available";
+  $("up-text").textContent = `Media Compressor ${update.version} is available — you have ${update.currentVersion}. `
+    + "It will download, install and restart the app.";
+  const notes = (update.body ?? "").trim();
+  $("up-notes").hidden = !notes;
+  $("up-notes").textContent = notes;
+  $("up-progress").hidden = true;
+  $("up-error").textContent = "";
+  $("up-actions").hidden = false;
+  $<HTMLButtonElement>("up-install").disabled = false;
+  $("up-install").textContent = "Update now";
+  $("update-modal").hidden = false;
+}
+
+async function installUpdate(): Promise<void> {
+  const update = pendingUpdate;
+  if (!update) return;
+  if (exporting) {
+    $("up-error").textContent = "Wait for the current export to finish, then update.";
+    return;
+  }
+  $("up-actions").hidden = true;
+  $("up-progress").hidden = false;
+  $("up-error").textContent = "";
+  $("up-title").textContent = `Updating to ${update.version}…`;
+  let total = 0;
+  let done = 0;
+  const mb = (n: number): string => (n / 1048576).toFixed(1);
+  try {
+    await update.downloadAndInstall((ev) => {
+      if (ev.event === "Started") {
+        total = ev.data.contentLength ?? 0;
+        $("up-detail").textContent = "Downloading…";
+      } else if (ev.event === "Progress") {
+        done += ev.data.chunkLength;
+        $("up-bar").style.width = total ? `${((done / total) * 100).toFixed(1)}%` : "50%";
+        $("up-pct").textContent = total ? `${Math.floor((done / total) * 100)}%` : "";
+        $("up-detail").textContent = total ? `${mb(done)} MB of ${mb(total)} MB` : `${mb(done)} MB`;
+      } else if (ev.event === "Finished") {
+        $("up-bar").style.width = "100%";
+        $("up-detail").textContent = "Installing…";
+      }
+    });
+    $("up-detail").textContent = "Restarting…";
+    await invoke("clear_previews").catch(() => {});
+    await relaunch();
+  } catch (e) {
+    $("up-title").textContent = "Update failed";
+    $("up-error").textContent = String(e);
+    $("up-progress").hidden = true;
+    $("up-actions").hidden = false;
+    $("up-install").textContent = "Try again";
+  }
+}
+
+function bindUpdates(): void {
+  $("up-install").addEventListener("click", () => void installUpdate());
+  $("up-later").addEventListener("click", () => ($("update-modal").hidden = true));
+  $("up-skip").addEventListener("click", async () => {
+    if (pendingUpdate) {
+      settings.skippedVersion = pendingUpdate.version;
+      await invoke("save_settings", { settings }).catch(() => {});
+    }
+    $("update-modal").hidden = true;
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -1539,6 +1645,7 @@ async function init(): Promise<void> {
   } catch { /* first run */ }
   cfg = freshConfig();
   bindSetup();
+  bindUpdates();
 
   await listen<Progress>("export-progress", (e) => onExportProgress(e.payload));
   await listen<Progress>("preview-progress", (e) => {
@@ -1556,6 +1663,8 @@ async function init(): Promise<void> {
   });
 
   await runSetup();
+  // Dev builds (npm run tauri dev) skip the automatic check; "Check now" still works.
+  if (settings.autoUpdateCheck && !import.meta.env.DEV) window.setTimeout(() => void checkForUpdates(false), 2500);
 
   await getCurrentWebview().onDragDropEvent((e) => {
     const dz = $("dropzone");

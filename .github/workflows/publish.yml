@@ -1,0 +1,120 @@
+# Builds Media Compressor for Windows, macOS (Apple Silicon + Intel) and Linux
+# whenever a GitHub Release is published, and uploads the installers to it.
+# It also uploads `latest.json` + signatures, which the app's built-in updater reads.
+#
+# One-time setup (see README → "Releases & auto-update"):
+#   1. Run `npm run setup-updater` locally. It creates the signing key and puts the
+#      public key in src-tauri/tauri.conf.json.
+#   2. Add the repository secrets it prints:
+#        TAURI_SIGNING_PRIVATE_KEY           (contents of the private key file)
+#        TAURI_SIGNING_PRIVATE_KEY_PASSWORD  (the password you chose; can be empty)
+#
+# To release: create a release on GitHub with a tag like `v0.2.0` and publish it.
+# The version number is taken from the tag, so you don't need to edit any files.
+
+name: publish
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing release tag to build for (e.g. v0.2.0)"
+        required: true
+
+permissions:
+  contents: write
+
+concurrency:
+  group: publish-${{ github.event.release.tag_name || inputs.tag }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Windows x64
+            platform: windows-latest
+            args: ""
+          - name: macOS (Apple Silicon)
+            platform: macos-latest
+            args: --target aarch64-apple-darwin
+          - name: macOS (Intel)
+            platform: macos-latest
+            args: --target x86_64-apple-darwin
+          - name: Linux x64
+            platform: ubuntu-22.04
+            args: ""
+    runs-on: ${{ matrix.platform }}
+    env:
+      TAG: ${{ github.event.release.tag_name || inputs.tag }}
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TAG }}
+
+      - name: Set app version from the release tag
+        shell: bash
+        run: |
+          VERSION="${TAG#v}"
+          if ! [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+            echo "::error::Release tag '$TAG' must look like v1.2.3"; exit 1
+          fi
+          node -e '
+            const fs = require("fs");
+            for (const f of ["src-tauri/tauri.conf.json", "package.json"]) {
+              const j = JSON.parse(fs.readFileSync(f, "utf8"));
+              j.version = process.argv[1];
+              fs.writeFileSync(f, JSON.stringify(j, null, 2) + "\n");
+            }' "$VERSION"
+          echo "Building version $VERSION"
+
+      - name: Check the updater key is configured
+        shell: bash
+        env:
+          HAS_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY != '' }}
+        run: |
+          if grep -q "REPLACE_WITH_UPDATER_PUBLIC_KEY" src-tauri/tauri.conf.json; then
+            echo "::error::Updater public key not set. Run 'npm run setup-updater' and commit tauri.conf.json."; exit 1
+          fi
+          if [ "$HAS_KEY" != "true" ]; then
+            echo "::error::Repository secret TAURI_SIGNING_PRIVATE_KEY is missing (see README)."; exit 1
+          fi
+
+      - name: Install Linux build dependencies
+        if: matrix.platform == 'ubuntu-22.04'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: lts/*
+          cache: npm
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.platform == 'macos-latest' && 'aarch64-apple-darwin,x86_64-apple-darwin' || '' }}
+
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri -> target
+
+      - run: npm ci
+
+      - uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        with:
+          tagName: ${{ env.TAG }}
+          releaseId: ${{ github.event.release.id }}
+          # Adds the updater artifacts (.sig files) only for release builds.
+          args: ${{ matrix.args }} --config src-tauri/tauri.release.conf.json
+          includeUpdaterJson: true

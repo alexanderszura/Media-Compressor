@@ -43,6 +43,10 @@ export interface Settings {
   masterTrackName: string;
   /** Default names by source track number (index 0 = track 1). "" = keep the file's own name. */
   trackNames: string[];
+  /** Check GitHub Releases for a new version on startup. */
+  autoUpdateCheck: boolean;
+  /** Version the user chose "Skip this version" for. */
+  skippedVersion: string;
   mode: Mode;
   videoBitrate: number;
   targetSizeMB: number;
