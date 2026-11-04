@@ -5,7 +5,7 @@ import { getVersion } from "@tauri-apps/api/app";
 import { check, type Update } from "@tauri-apps/plugin-updater";
 import { relaunch } from "@tauri-apps/plugin-process";
 import {
-  applyTemplate, bitrateForTargetSize, estimateSizeMB, formatBytes, formatDuration, formatTime,
+  applyTemplate, bitrateForTargetSize, canCopyAudio, estimateSizeMB, formatBytes, formatDuration, formatTime,
   joinPath, median, parseRate, parseTime, planPreview, splitPath, templateVars, TEMPLATE_VARS,
 } from "./util";
 import type {
@@ -792,6 +792,22 @@ $("audio-list").addEventListener("click", (e) => {
   updateConfigUI();
 });
 
+/** Trim only: the video stream is copied, nothing is re-encoded unless it has to be. */
+function trimOnly(): boolean {
+  return cfg.mode === "copy";
+}
+
+/** Per output track (master first): copy the source audio as-is? Only in trim-only mode. */
+function audioCopyFlags(): boolean[] {
+  const plan = audioPlan();
+  if (!media || !trimOnly()) return new Array(plan.outTracks).fill(false);
+  const ext = splitPath(cfg.filename).ext;
+  const ok = (i: number): boolean => canCopyAudio(media!.audio[i].codec, ext);
+  const flags = plan.master.length ? [plan.master.length === 1 && ok(plan.master[0])] : [];
+  for (const i of plan.separate) flags.push(ok(i));
+  return flags;
+}
+
 function audioPlan(): { master: number[]; separate: number[]; outTracks: number } {
   const a = media?.audio ?? [];
   const master = a.filter((t) => t.role === "master").map((t) => t.index);
@@ -801,6 +817,7 @@ function audioPlan(): { master: number[]; separate: number[]; outTracks: number 
 
 function computeVideoKbps(): { kbps: number; ok: boolean } {
   const plan = audioPlan();
+  if (trimOnly()) return { kbps: 0, ok: true };
   if (cfg.mode === "bitrate") return { kbps: Math.round(cfg.videoBitrate), ok: cfg.videoBitrate >= 50 };
   const r = bitrateForTargetSize({
     targetMB: cfg.targetSizeMB, duration: outPt - inPt, audioKbps: cfg.audioBitrate, audioTracks: plan.outTracks,
@@ -816,16 +833,32 @@ function updateConfigUI(): void {
 
   for (const b of document.querySelectorAll<HTMLButtonElement>("#mode-seg button"))
     b.classList.toggle("on", b.dataset.mode === cfg.mode);
+  $("f-encode").hidden = trimOnly();
+  $("f-twopass").hidden = trimOnly();
   $("f-bitrate").hidden = cfg.mode !== "bitrate";
   $("f-size").hidden = cfg.mode !== "size";
   $("f-preset").hidden = hw;
   $("f-twopass").classList.toggle("disabled", hw);
 
+  // Audio tracks that will be (re-)encoded, i.e. that the audio bitrate applies to.
+  const copyFlags = audioCopyFlags();
+  const encodedTracks = copyFlags.filter((c) => !c).length;
+  $("f-abitrate").hidden = trimOnly() && encodedTracks === 0;
+
   // Video readout
   const { kbps, ok } = computeVideoKbps();
   const src = media.videoKbps ? `Source ≈ ${media.videoKbps.toLocaleString()} kbps. ` : "";
   let html: string;
-  if (cfg.mode === "bitrate") {
+  if (trimOnly()) {
+    // Output tracks in order: master first, then the separate ones.
+    const outSources = [...(plan.master.length ? [plan.master[0]] : []), ...plan.separate];
+    const audioKbps = copyFlags.reduce(
+      (sum, copied, i) => sum + (copied ? media!.audio[outSources[i]].bitrate || cfg.audioBitrate : cfg.audioBitrate), 0);
+    const mb = estimateSizeMB({ videoKbps: media.videoKbps, duration, audioKbps, audioTracks: 1 });
+    html = (media.videoKbps ? `${src}Estimated size ≈ <b>${mb.toFixed(1)} MB</b><br>` : "") +
+      "The video is copied as-is — no compression, no quality loss, and much faster." +
+      `<br><span class="muted">The clip may start slightly before your in-point, because a copied video can only begin on a keyframe.</span>`;
+  } else if (cfg.mode === "bitrate") {
     const mb = estimateSizeMB({ videoKbps: kbps, duration, audioKbps: cfg.audioBitrate, audioTracks: plan.outTracks });
     html = `${src}Estimated size ≈ <b>${mb.toFixed(1)} MB</b>`;
   } else if (!ok) {
@@ -835,7 +868,7 @@ function updateConfigUI(): void {
       (plan.outTracks ? ` + ${plan.outTracks} × ${cfg.audioBitrate} kbps audio` : "");
     if (hw) html += `<br><span class="muted">NVENC is single-pass, so the final size may be off by a few percent.</span>`;
   }
-  if (media.videoKbps && kbps > media.videoKbps * 1.05 && ok)
+  if (!trimOnly() && media.videoKbps && kbps > media.videoKbps * 1.05 && ok)
     html += `<br><span class="muted">That's higher than the source bitrate — the file may get bigger, not smaller.</span>`;
   $("cfg-readout").innerHTML = html;
 
@@ -844,9 +877,17 @@ function updateConfigUI(): void {
   if (plan.master.length > 1) parts.push(`1 master track (tracks ${plan.master.map((i) => i + 1).join(" + ")} mixed)`);
   else if (plan.master.length === 1) parts.push(`master = track ${plan.master[0] + 1}`);
   if (plan.separate.length) parts.push(`${plan.separate.length} separate (${plan.separate.map((i) => `track ${i + 1}`).join(", ")})`);
-  $("audio-readout").textContent = media.audio.length
+  let audioText = media.audio.length
     ? `Output: ${plan.outTracks} audio track${plan.outTracks === 1 ? "" : "s"}${parts.length ? " — " + parts.join(", ") : " (no audio)"}`
     : "Output will have no audio.";
+  if (trimOnly() && plan.outTracks) {
+    audioText += encodedTracks === 0
+      ? ". Audio is copied without re-encoding."
+      : `. ${encodedTracks} track${encodedTracks === 1 ? " is" : "s are"} converted to AAC` +
+        (plan.master.length > 1 ? " (mixing tracks needs re-encoding)" : " (not supported as-is in this file type)") +
+        (encodedTracks < plan.outTracks ? "; the rest are copied." : ".");
+  }
+  $("audio-readout").textContent = audioText;
   $("audio-readout").hidden = !media.audio.length;
 
   // Filename warning
@@ -935,15 +976,26 @@ async function startExport(): Promise<void> {
     start: inPt,
     end: outPt,
     ffmpegDir: settings.ffmpegDir,
-    video: media.hasVideo ? {
+    video: !media.hasVideo ? null : trimOnly() ? {
+      encoder: "copy",
+      preset: "",
+      bitrateKbps: 0,
+      twoPass: false,
+      scaleHeight: null,
+      sizeMode: false,
+      sourceCodec: media.videoCodec,
+    } : {
       encoder: cfg.encoder,
       preset: cfg.preset,
       bitrateKbps: kbps,
       twoPass: cfg.twoPass,
       scaleHeight: cfg.resolution === "orig" ? null : Number(cfg.resolution),
       sizeMode: cfg.mode === "size",
-    } : null,
-    audio: { master: plan.master, separate: plan.separate, bitrateKbps: cfg.audioBitrate, titles: outputTitles() },
+    },
+    audio: {
+      master: plan.master, separate: plan.separate, bitrateKbps: cfg.audioBitrate, titles: outputTitles(),
+      copy: audioCopyFlags(),
+    },
   };
 
   exporting = true;

@@ -145,8 +145,9 @@
             <div class="seg" id="mode-seg">
               <button data-mode="bitrate">Bitrate</button>
               <button data-mode="size">Target file size</button>
+              <button data-mode="copy" title="Cut the clip without compressing or re-encoding the video">Trim only</button>
             </div>
-            <div class="grid2">
+            <div class="grid2" id="f-encode">
               <label class="field" id="f-bitrate">
                 <span>Video bitrate</span>
                 <div class="suffix"><input id="cfg-bitrate" type="number" min="100" step="100" /><em>kbps</em></div>
@@ -186,7 +187,7 @@
             <p class="muted small-text">Tracks set to <b>Master</b> are mixed together into one track. <b>Keep</b> tracks are copied as their own separate tracks. <b>Remove</b> drops them to save space.</p>
             <div id="audio-list" class="audio-list"></div>
             <div class="grid2">
-              <label class="field">
+              <label class="field" id="f-abitrate">
                 <span>Audio bitrate (per track)</span>
                 <select id="cfg-abitrate">
                   <option value="64">64 kbps</option><option value="96">96 kbps</option>
@@ -276,7 +277,7 @@
         <h2>Defaults for new exports</h2>
         <div class="grid2">
           <label class="field"><span>Mode</span>
-            <select id="set-mode"><option value="bitrate">Bitrate</option><option value="size">Target file size</option></select>
+            <select id="set-mode"><option value="bitrate">Bitrate</option><option value="size">Target file size</option><option value="copy">Trim only (no compression)</option></select>
           </label>
           <label class="field"><span>Video bitrate (kbps)</span><input id="set-bitrate" type="number" min="100" step="100" /></label>
           <label class="field"><span>Target size (MB)</span><input id="set-size" type="number" min="1" step="1" /></label>

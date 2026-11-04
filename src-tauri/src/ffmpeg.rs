@@ -6,7 +6,8 @@ use serde::Deserialize;
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct VideoOptions {
-    /// libx264 | libx265 | h264_nvenc | hevc_nvenc | (any other ffmpeg encoder name)
+    /// libx264 | libx265 | h264_nvenc | hevc_nvenc | (any other ffmpeg encoder name),
+    /// or "copy" to keep the original video stream untouched (trim only, no re-encode).
     pub encoder: String,
     /// x264/x265 preset (ultrafast .. veryslow). Ignored by hardware encoders.
     pub preset: String,
@@ -18,6 +19,15 @@ pub struct VideoOptions {
     /// True when the bitrate came from a target file size (tighter rate control).
     #[serde(default)]
     pub size_mode: bool,
+    /// Codec of the source video stream (ffprobe name). Only used with "copy".
+    #[serde(default)]
+    pub source_codec: Option<String>,
+}
+
+impl VideoOptions {
+    pub fn is_copy(&self) -> bool {
+        self.encoder == "copy"
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -32,6 +42,10 @@ pub struct AudioOptions {
     /// Empty / missing entries fall back to "Master (Tracks 1 + 3)" / "Track 2".
     #[serde(default)]
     pub titles: Vec<String>,
+    /// Per output track (same order as `titles`): true = copy the source audio
+    /// as-is instead of encoding AAC. Ignored for a mixed master track.
+    #[serde(default)]
+    pub copy: Vec<bool>,
 }
 
 /// Audio part of the graph: optional amix filter, -map targets and track titles.
@@ -73,7 +87,7 @@ pub fn supports_two_pass(encoder: &str) -> bool {
 /// Number of ffmpeg invocations needed.
 pub fn pass_count(video: Option<&VideoOptions>) -> u8 {
     match video {
-        Some(v) if v.two_pass && supports_two_pass(&v.encoder) => 2,
+        Some(v) if v.two_pass && !v.is_copy() && supports_two_pass(&v.encoder) => 2,
         _ => 1,
     }
 }
@@ -101,6 +115,13 @@ fn track_list(idx: &[u32]) -> String {
 }
 
 fn video_codec_args(v: &VideoOptions, pass: Option<u8>, out_ext: &str) -> Vec<String> {
+    if v.is_copy() {
+        let mut a: Vec<String> = vec!["-c:v".into(), "copy".into()];
+        if v.source_codec.as_deref() == Some("hevc") && is_mp4_family(out_ext) {
+            a.extend(["-tag:v".into(), "hvc1".into()]);
+        }
+        return a;
+    }
     let b = v.bitrate_kbps.max(1);
     let mut a: Vec<String> = Vec::new();
     let mut push = |s: &str| a.push(s.to_string());
@@ -216,7 +237,7 @@ pub fn build_args(
     let mut audio_titles: Vec<String> = Vec::new();
 
     if let Some(v) = video {
-        match v.scale_height {
+        match v.scale_height.filter(|_| !v.is_copy()) {
             Some(h) => {
                 filters.push(format!("[0:v:0]scale=-2:{h}[vout]"));
                 maps.push("[vout]".into());
@@ -255,10 +276,23 @@ pub fn build_args(
     if audio_titles.is_empty() {
         a.push("-an".into());
     } else {
-        a.push("-c:a".into());
-        a.push("aac".into());
-        a.push("-b:a".into());
-        a.push(format!("{}k", audio.bitrate_kbps.max(32)));
+        let abr = format!("{}k", audio.bitrate_kbps.max(32));
+        let mixed = audio.master.len() > 1;
+        let copies: Vec<bool> = (0..audio_titles.len())
+            .map(|i| !(mixed && i == 0) && audio.copy.get(i).copied().unwrap_or(false))
+            .collect();
+        if copies.iter().any(|c| *c) {
+            for (i, c) in copies.iter().enumerate() {
+                a.push(format!("-c:a:{i}"));
+                if *c {
+                    a.push("copy".into());
+                } else {
+                    a.extend(["aac".into(), format!("-b:a:{i}"), abr.clone()]);
+                }
+            }
+        } else {
+            a.extend(["-c:a".into(), "aac".into(), "-b:a".into(), abr]);
+        }
         for (i, t) in audio_titles.iter().enumerate() {
             a.push(format!("-metadata:s:a:{i}"));
             a.push(format!("title={t}"));
@@ -272,6 +306,10 @@ pub fn build_args(
 
     for s in ["-sn", "-dn", "-map_metadata", "0", "-map_chapters", "-1"] {
         a.push(s.into());
+    }
+    if video.is_some_and(|v| v.is_copy()) || audio.copy.iter().any(|c| *c) {
+        // Copied streams keep their source timestamps; shift them so the cut starts at 0.
+        a.extend(["-avoid_negative_ts".into(), "make_zero".into()]);
     }
     if is_mp4_family(&out_ext) {
         a.push("-movflags".into());
@@ -386,6 +424,7 @@ mod tests {
             two_pass: two,
             scale_height: None,
             size_mode: false,
+            source_codec: None,
         }
     }
 
@@ -395,7 +434,7 @@ mod tests {
 
     #[test]
     fn master_mix_and_separate() {
-        let au = AudioOptions { master: vec![0, 2], separate: vec![1], bitrate_kbps: 160, titles: vec![] };
+        let au = AudioOptions { master: vec![0, 2], separate: vec![1], bitrate_kbps: 160, titles: vec![], copy: vec![] };
         let a = build_args("in.mkv", "out.mp4", 5.0, 20.5, Some(&v("libx264", false)), &au, None);
         let s = joined(&a);
         assert!(s.contains("-ss 5.000 -t 15.500 -i in.mkv"));
@@ -410,7 +449,7 @@ mod tests {
     #[test]
     fn custom_track_titles() {
         let au = AudioOptions { master: vec![0, 2], separate: vec![1], bitrate_kbps: 160,
-            titles: vec!["Game + Mic".into(), "".into()] };
+            titles: vec!["Game + Mic".into(), "".into()], copy: vec![] };
         let s = joined(&build_args("in.mkv", "out.mkv", 0.0, 5.0, None, &au, None));
         assert!(s.contains("title=Game + Mic") && s.contains("title=Track 2"));
     }
@@ -428,7 +467,7 @@ mod tests {
         assert!(Command::new("ffmpeg").args(["-v", "error", "-y", "-f", "lavfi", "-i", "testsrc2=size=640x360:rate=30:duration=6",
             "-f", "lavfi", "-i", "sine=f=300:d=6", "-f", "lavfi", "-i", "sine=f=500:d=6", "-f", "lavfi", "-i", "sine=f=700:d=6",
             "-map", "0", "-map", "1", "-map", "2", "-map", "3", "-c:v", "libx264", "-c:a", "aac"]).arg(&src).status().unwrap().success());
-        let au = AudioOptions { master: vec![0, 2], separate: vec![1], bitrate_kbps: 128, titles: vec![] };
+        let au = AudioOptions { master: vec![0, 2], separate: vec![1], bitrate_kbps: 128, titles: vec![], copy: vec![] };
         let v = dir.join("v.mp4").to_string_lossy().into_owned();
         let outs = vec![dir.join("a0.m4a").to_string_lossy().into_owned(), dir.join("a1.m4a").to_string_lossy().into_owned()];
         let args = cut_preview_args(src.to_str().unwrap(), 1.0, 4.0, true, &au, &v, &outs);
@@ -443,7 +482,7 @@ mod tests {
 
     #[test]
     fn two_pass_first_pass_has_no_audio() {
-        let au = AudioOptions { master: vec![0], separate: vec![], bitrate_kbps: 128, titles: vec![] };
+        let au = AudioOptions { master: vec![0], separate: vec![], bitrate_kbps: 128, titles: vec![], copy: vec![] };
         let vo = v("libx264", true);
         assert_eq!(pass_count(Some(&vo)), 2);
         let p1 = joined(&build_args("in.mp4", "o.mp4", 0.0, 10.0, Some(&vo), &au, Some(1)));
@@ -457,7 +496,7 @@ mod tests {
 
     #[test]
     fn x265_and_nvenc() {
-        let au = AudioOptions { master: vec![], separate: vec![], bitrate_kbps: 128, titles: vec![] };
+        let au = AudioOptions { master: vec![], separate: vec![], bitrate_kbps: 128, titles: vec![], copy: vec![] };
         let s = joined(&build_args("i.mp4", "o.mkv", 0.0, 1.0, Some(&v("libx265", true)), &au, Some(2)));
         assert!(s.contains("pass=2:stats=mc2pass.log"));
         assert!(!s.contains("hvc1"));
@@ -493,12 +532,12 @@ mod tests {
         assert!(ok);
         let out = dir.join("src-CUT.mp4");
         let (input, output) = (src.to_str().unwrap(), out.to_str().unwrap());
-        let au = AudioOptions { master: vec![0, 2], separate: vec![1], bitrate_kbps: 128, titles: vec![] };
+        let au = AudioOptions { master: vec![0, 2], separate: vec![1], bitrate_kbps: 128, titles: vec![], copy: vec![] };
         let dur = 8.0;
         let audio_kbps = 128.0 * 2.0;
         let video_kbps = (1.0 * 1048576.0 * 8.0 * 0.97 / 1000.0 / dur - audio_kbps) as u32;
         let vo = VideoOptions { encoder: "libx264".into(), preset: "veryfast".into(),
-            bitrate_kbps: video_kbps, two_pass: true, scale_height: Some(480), size_mode: true };
+            bitrate_kbps: video_kbps, two_pass: true, scale_height: Some(480), size_mode: true, source_codec: None };
         for p in 1..=2u8 {
             let args = build_args(input, output, 2.0, 10.0, Some(&vo), &au, Some(p));
             let o = Command::new("ffmpeg").args(&args).current_dir(&dir).output().unwrap();
@@ -550,15 +589,63 @@ mod tests {
             assert!(o.status.success(), "{src:?} {mode:?}: {}", String::from_utf8_lossy(&o.stderr));
             let p = Command::new("ffprobe").args(["-v", "error", "-show_entries", "stream=codec_name", "-of", "csv=p=0"])
                 .arg(&out).output().unwrap();
-            let codecs = String::from_utf8_lossy(&p.stdout).replace('\n', ",");
+            let codecs = String::from_utf8_lossy(&p.stdout).replace("\r\n", "\n").replace('\n', ",");
             eprintln!("{mode:?} {:?} -> {codecs}", src.file_name().unwrap());
             assert!(codecs.starts_with("h264,") && codecs.contains("aac"), "{codecs}");
         }
     }
 
     #[test]
+    fn trim_only_copies_streams() {
+        let au = AudioOptions { master: vec![0, 2], separate: vec![1], bitrate_kbps: 160, titles: vec![],
+            copy: vec![true, true] };
+        let mut vo = v("copy", true);
+        vo.scale_height = Some(720);
+        vo.source_codec = Some("hevc".into());
+        assert_eq!(pass_count(Some(&vo)), 1);
+        let s = joined(&build_args("in.mkv", "out.mp4", 3.0, 9.0, Some(&vo), &au, None));
+        assert!(s.contains("-map 0:v:0 -map [amaster] -map 0:a:1"), "{s}");
+        assert!(s.contains("-c:v copy -tag:v hvc1"), "{s}");
+        assert!(!s.contains("scale=") && !s.contains("-pix_fmt"), "{s}");
+        // A mixed master has to be encoded even when copying was requested.
+        assert!(s.contains("-c:a:0 aac -b:a:0 160k -c:a:1 copy"), "{s}");
+        assert!(s.contains("-avoid_negative_ts make_zero"), "{s}");
+    }
+
+    /// Trim-only against real ffmpeg: output keeps the source codecs and roughly the cut length.
+    #[test]
+    fn real_trim_only() {
+        use std::process::Command;
+        if Command::new("ffmpeg").arg("-version").output().is_err() {
+            return;
+        }
+        let dir = std::env::temp_dir().join("mc-trim");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let src = dir.join("s.mkv");
+        assert!(Command::new("ffmpeg").args(["-v", "error", "-y", "-f", "lavfi", "-i", "testsrc2=size=640x360:rate=30:duration=10",
+            "-f", "lavfi", "-i", "sine=f=300:d=10", "-f", "lavfi", "-i", "sine=f=500:d=10",
+            "-map", "0", "-map", "1", "-map", "2", "-c:v", "libx264", "-g", "30", "-c:a", "ac3"]).arg(&src).status().unwrap().success());
+        let out = dir.join("o.mkv");
+        let au = AudioOptions { master: vec![0], separate: vec![1], bitrate_kbps: 128, titles: vec![], copy: vec![true, true] };
+        let mut vo = v("copy", false);
+        vo.source_codec = Some("h264".into());
+        let args = build_args(src.to_str().unwrap(), out.to_str().unwrap(), 2.0, 7.0, Some(&vo), &au, None);
+        let o = Command::new("ffmpeg").args(&args).output().unwrap();
+        assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+        let p = Command::new("ffprobe").args(["-v", "error", "-show_entries", "stream=codec_name:format=duration", "-of", "csv=p=0"])
+            .arg(&out).output().unwrap();
+        let text = String::from_utf8_lossy(&p.stdout).into_owned();
+        let lines: Vec<&str> = text.lines().map(str::trim).filter(|l| !l.is_empty()).collect();
+        assert_eq!(lines[..3], ["h264", "ac3", "ac3"], "{text}");
+        let d: f64 = lines[3].parse().unwrap();
+        // Copying can't start mid-GOP, so the cut may begin up to one GOP (1 s here) early.
+        assert!(d > 4.9 && d < 6.3, "{d}");
+    }
+
+    #[test]
     fn scaling_goes_through_filter_complex() {
-        let au = AudioOptions { master: vec![0], separate: vec![], bitrate_kbps: 128, titles: vec![] };
+        let au = AudioOptions { master: vec![0], separate: vec![], bitrate_kbps: 128, titles: vec![], copy: vec![] };
         let mut vo = v("libx264", false);
         vo.scale_height = Some(720);
         let s = joined(&build_args("i.mp4", "o.mp4", 0.0, 1.0, Some(&vo), &au, None));

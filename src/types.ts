@@ -21,7 +21,8 @@ export interface ProbeResult {
   format: { duration?: string; bit_rate?: string; size?: string; format_name?: string };
 }
 
-export type Mode = "bitrate" | "size";
+/** "copy" = trim only: keep the original video stream, no re-encode. */
+export type Mode = "bitrate" | "size" | "copy";
 export type Encoder = "libx264" | "libx265" | "h264_nvenc" | "hevc_nvenc";
 export type TrackRole = "master" | "separate" | "remove";
 
@@ -82,6 +83,8 @@ export interface AudioRequest {
   bitrateKbps: number;
   /** Output track names in output order (master first). */
   titles: string[];
+  /** Per output track: copy the source audio instead of encoding AAC (ignored for a mixed master). */
+  copy?: boolean[];
 }
 
 export interface CutPreviewResult {
@@ -96,12 +99,14 @@ export interface ExportRequest {
   end: number;
   ffmpegDir: string;
   video: {
-    encoder: Encoder;
+    /** "copy" keeps the source video stream as-is. */
+    encoder: Encoder | "copy";
     preset: string;
     bitrateKbps: number;
     twoPass: boolean;
     scaleHeight: number | null;
     sizeMode: boolean;
+    sourceCodec?: string | null;
   } | null;
   audio: AudioRequest;
 }

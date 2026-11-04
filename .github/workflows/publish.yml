@@ -117,4 +117,31 @@ jobs:
           releaseId: ${{ github.event.release.id }}
           # Adds the updater artifacts (.sig files) only for release builds.
           args: ${{ matrix.args }} --config src-tauri/tauri.release.conf.json
-          includeUpdaterJson: true
+          # latest.json is written once by the `updater-json` job below. Letting every
+          # matrix job upload it races and fails with "already_exists".
+          includeUpdaterJson: false
+
+  updater-json:
+    name: Publish latest.json
+    needs: build
+    # Still publish the platforms that did build if one of them failed.
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-latest
+    env:
+      TAG: ${{ github.event.release.tag_name || inputs.tag }}
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TAG }}
+
+      - name: Build latest.json from the release assets
+        run: |
+          gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json tagName,body,assets > release.json
+          mkdir -p sigs
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --pattern '*.sig' --dir sigs --clobber
+          node scripts/make-latest-json.mjs release.json sigs > latest.json
+          cat latest.json
+
+      - name: Upload latest.json
+        run: gh release upload "$TAG" latest.json --repo "$GITHUB_REPOSITORY" --clobber

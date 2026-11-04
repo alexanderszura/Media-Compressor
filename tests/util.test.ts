@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
-  applyTemplate, bitrateForTargetSize, estimateSizeMB, formatCutVar, formatTime, joinPath, median,
+  applyTemplate, bitrateForTargetSize, canCopyAudio, estimateSizeMB, formatCutVar, formatTime, joinPath, median,
   outputExt, parseRate, parseTime, planPreview, splitPath, templateVars,
 } from "../src/util";
 
@@ -63,5 +63,15 @@ describe("size math", () => {
     expect(mb).toBeGreaterThan(24.9);
     expect(mb).toBeLessThanOrEqual(25);
     expect(bitrateForTargetSize({ targetMB: 1, duration: 600, audioKbps: 160, audioTracks: 2 }).ok).toBe(false);
+  });
+});
+
+describe("trim-only audio copy", () => {
+  it("copies only codecs the output container can hold", () => {
+    expect(canCopyAudio("aac", ".mp4")).toBe(true);
+    expect(canCopyAudio("pcm_s16le", ".mp4")).toBe(false);
+    expect(canCopyAudio("pcm_s16le", ".MOV")).toBe(true);
+    expect(canCopyAudio("dts", ".mkv")).toBe(true);
+    expect(canCopyAudio("aac", ".avi")).toBe(false);
   });
 });

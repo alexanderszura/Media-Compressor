@@ -89,6 +89,22 @@ export function outputExt(inputExt: string, format: "same" | "mp4" | "mkv" = "sa
   return SAFE_OUTPUT_EXTS.includes(inputExt.toLowerCase()) ? inputExt : ".mp4";
 }
 
+/** Audio codecs (ffprobe names) that can be stream-copied into MP4 / MOV without converting. */
+const MP4_AUDIO = ["aac", "mp3", "ac3", "eac3", "alac", "opus", "flac"];
+const MOV_AUDIO = [...MP4_AUDIO, "pcm_s16le", "pcm_s16be", "pcm_s24le", "pcm_s24be", "pcm_f32le"];
+
+/** Whether an audio track can be copied as-is into a file with this extension (trim-only mode). */
+export function canCopyAudio(codec: string, outputExt: string): boolean {
+  const c = codec.toLowerCase();
+  if (!c) return false;
+  switch (outputExt.toLowerCase()) {
+    case ".mkv": return true;
+    case ".mov": return MOV_AUDIO.includes(c);
+    case ".mp4": case ".m4v": return MP4_AUDIO.includes(c);
+    default: return false;
+  }
+}
+
 export function templateVars(
   inputPath: string, start: number, end: number, format: "same" | "mp4" | "mkv" = "same"
 ): TemplateVars {
