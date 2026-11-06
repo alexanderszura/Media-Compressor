@@ -46,6 +46,30 @@ export function parseRate(r: string | undefined | null): number {
   return a / b;
 }
 
+const FPS_PRESETS = [120, 60, 50, 48, 30, 25, 24, 20, 15, 10];
+
+/**
+ * Frame rates offered for a source, always lower than what was recorded. The margin
+ * stops "30" being offered for 30.01 or 30.2 footage, where it wouldn't be a real drop.
+ */
+export function fpsChoices(sourceFps: number): number[] {
+  return FPS_PRESETS.filter((f) => f < sourceFps - 0.5);
+}
+
+/** 59.94005994 -> 59.94 */
+export function formatFps(fps: number): number {
+  return Math.round(fps * 100) / 100;
+}
+
+/**
+ * Why a typed frame rate can't be used, or "" if it can. Compares against the rate as
+ * displayed, so typing the "59.94" shown for 59.94005994 footage isn't a lower rate.
+ */
+export function customFpsError(value: number, sourceFps: number): string {
+  if (value >= 1 && value < formatFps(sourceFps)) return "";
+  return `Custom frame rate must be at least 1 and below the recorded ${formatFps(sourceFps)} fps.`;
+}
+
 export interface PathParts { dir: string; sep: string; base: string; name: string; ext: string }
 
 /** Split a Windows or POSIX path. ext includes the dot (".mp4"). */

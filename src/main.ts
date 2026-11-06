@@ -5,8 +5,9 @@ import { getVersion } from "@tauri-apps/api/app";
 import { check, type Update } from "@tauri-apps/plugin-updater";
 import { relaunch } from "@tauri-apps/plugin-process";
 import {
-  applyTemplate, bitrateForTargetSize, canCopyAudio, estimateSizeMB, formatBytes, formatDuration, formatTime,
-  joinPath, median, parseRate, parseTime, planPreview, splitPath, templateVars, TEMPLATE_VARS,
+  applyTemplate, bitrateForTargetSize, canCopyAudio, customFpsError, estimateSizeMB, formatBytes, formatDuration,
+  formatFps, formatTime, fpsChoices, joinPath, median, parseRate, parseTime, planPreview, splitPath, templateVars,
+  TEMPLATE_VARS,
 } from "./util";
 import type {
   AudioTrack, CutPreviewResult, Encoder, ExportRequest, ExportResult, FfmpegStatus, InstallProgress, Mode,
@@ -77,6 +78,8 @@ interface ExportConfig {
   preset: string;
   twoPass: boolean;
   resolution: string; // "orig" or a height
+  fps: string; // "orig", "custom" or a preset frame rate lower than the source's
+  customFps: number; // used when fps is "custom"; 0 = nothing entered
   filename: string;
   nameKey: string; // file+cut the filename was generated/edited for
   nameEdited: boolean;
@@ -132,6 +135,8 @@ function freshConfig(): ExportConfig {
     preset: settings.preset,
     twoPass: settings.twoPass,
     resolution: "orig",
+    fps: "orig",
+    customFps: 0,
     filename: "",
     nameKey: "",
     nameEdited: false,
@@ -259,7 +264,7 @@ async function openFile(path: string): Promise<void> {
 
   const { base, ext } = splitPath(path);
   const bits = [media.hasVideo ? `${media.width}×${media.height}` : "audio only"];
-  if (media.hasVideo) bits.push(`${Math.round(media.fps * 100) / 100} fps`);
+  if (media.hasVideo) bits.push(`${formatFps(media.fps)} fps`);
   if (media.videoCodec) bits.push(media.videoCodec.toUpperCase());
   bits.push(`${media.audio.length} audio track${media.audio.length === 1 ? "" : "s"}`);
   $("file-title").textContent = `${base}  —  ${bits.join(" · ")}`;
@@ -736,6 +741,15 @@ function fillConfig(): void {
   res.value = heights.includes(Number(cfg.resolution)) ? cfg.resolution : "orig";
   cfg.resolution = res.value;
 
+  const fps = $<HTMLSelectElement>("cfg-fps");
+  const rates = fpsChoices(media.fps);
+  fps.innerHTML = `<option value="orig">Original (${formatFps(media.fps)} fps)</option>` +
+    rates.map((r) => `<option value="${r}">${r} fps</option>`).join("") +
+    `<option value="custom">Custom…</option>`;
+  fps.value = cfg.fps === "custom" || rates.includes(Number(cfg.fps)) ? cfg.fps : "orig";
+  cfg.fps = fps.value;
+  $<HTMLInputElement>("cfg-fps-custom").value = cfg.customFps ? String(cfg.customFps) : "";
+
   renderAudioList();
   updateConfigUI();
 }
@@ -797,10 +811,24 @@ function trimOnly(): boolean {
   return cfg.mode === "copy";
 }
 
-/** Per output track (master first): copy the source audio as-is? Only in trim-only mode. */
+/** Trim only keeps the original video unless a lower frame rate forces a re-encode. */
+function copiesVideo(): boolean {
+  return trimOnly() && cfg.fps === "orig";
+}
+
+function targetFps(): number | null {
+  if (cfg.fps === "orig") return null;
+  return cfg.fps === "custom" ? cfg.customFps : Number(cfg.fps);
+}
+
+/**
+ * Per output track (master first): copy the source audio as-is? Only when the video is
+ * copied too. Copied audio starts at the keyframe before the cut, so next to a re-encoded,
+ * frame-accurate video it would play before the first picture.
+ */
 function audioCopyFlags(): boolean[] {
   const plan = audioPlan();
-  if (!media || !trimOnly()) return new Array(plan.outTracks).fill(false);
+  if (!media || !copiesVideo()) return new Array(plan.outTracks).fill(false);
   const ext = splitPath(cfg.filename).ext;
   const ok = (i: number): boolean => canCopyAudio(media!.audio[i].codec, ext);
   const flags = plan.master.length ? [plan.master.length === 1 && ok(plan.master[0])] : [];
@@ -817,7 +845,8 @@ function audioPlan(): { master: number[]; separate: number[]; outTracks: number 
 
 function computeVideoKbps(): { kbps: number; ok: boolean } {
   const plan = audioPlan();
-  if (trimOnly()) return { kbps: 0, ok: true };
+  // Re-encoding in trim-only mode has no bitrate setting: stay close to the source.
+  if (trimOnly()) return { kbps: media?.videoKbps || cfg.videoBitrate, ok: true };
   if (cfg.mode === "bitrate") return { kbps: Math.round(cfg.videoBitrate), ok: cfg.videoBitrate >= 50 };
   const r = bitrateForTargetSize({
     targetMB: cfg.targetSizeMB, duration: outPt - inPt, audioKbps: cfg.audioBitrate, audioTracks: plan.outTracks,
@@ -833,11 +862,13 @@ function updateConfigUI(): void {
 
   for (const b of document.querySelectorAll<HTMLButtonElement>("#mode-seg button"))
     b.classList.toggle("on", b.dataset.mode === cfg.mode);
-  $("f-encode").hidden = trimOnly();
+  $("f-res").hidden = trimOnly();
+  $("f-encoder").hidden = copiesVideo();
   $("f-twopass").hidden = trimOnly();
   $("f-bitrate").hidden = cfg.mode !== "bitrate";
   $("f-size").hidden = cfg.mode !== "size";
-  $("f-preset").hidden = hw;
+  $("f-fps-custom").hidden = cfg.fps !== "custom";
+  $("f-preset").hidden = hw || copiesVideo();
   $("f-twopass").classList.toggle("disabled", hw);
 
   // Audio tracks that will be (re-)encoded, i.e. that the audio bitrate applies to.
@@ -856,8 +887,10 @@ function updateConfigUI(): void {
       (sum, copied, i) => sum + (copied ? media!.audio[outSources[i]].bitrate || cfg.audioBitrate : cfg.audioBitrate), 0);
     const mb = estimateSizeMB({ videoKbps: media.videoKbps, duration, audioKbps, audioTracks: 1 });
     html = (media.videoKbps ? `${src}Estimated size ≈ <b>${mb.toFixed(1)} MB</b><br>` : "") +
-      "The video is copied as-is — no compression, no quality loss, and much faster." +
-      `<br><span class="muted">The clip may start slightly before your in-point, because a copied video can only begin on a keyframe.</span>`;
+      (copiesVideo()
+        ? "The video is copied as-is — no compression, no quality loss, and much faster." +
+          `<br><span class="muted">The clip may start slightly before your in-point, because a copied video can only begin on a keyframe.</span>`
+        : "Changing the frame rate means the video and audio are re-encoded, the video at about the source bitrate, so this is slower than a plain trim and loses a little quality.");
   } else if (cfg.mode === "bitrate") {
     const mb = estimateSizeMB({ videoKbps: kbps, duration, audioKbps: cfg.audioBitrate, audioTracks: plan.outTracks });
     html = `${src}Estimated size ≈ <b>${mb.toFixed(1)} MB</b>`;
@@ -870,6 +903,9 @@ function updateConfigUI(): void {
   }
   if (!trimOnly() && media.videoKbps && kbps > media.videoKbps * 1.05 && ok)
     html += `<br><span class="muted">That's higher than the source bitrate — the file may get bigger, not smaller.</span>`;
+  // An empty box is just unfinished, so it only gets flagged when exporting.
+  if (cfg.fps === "custom" && cfg.customFps && customFpsError(cfg.customFps, media.fps))
+    html += `<br><span class="bad">${customFpsError(cfg.customFps, media.fps)}</span>`;
   $("cfg-readout").innerHTML = html;
 
   // Audio readout
@@ -880,7 +916,7 @@ function updateConfigUI(): void {
   let audioText = media.audio.length
     ? `Output: ${plan.outTracks} audio track${plan.outTracks === 1 ? "" : "s"}${parts.length ? " — " + parts.join(", ") : " (no audio)"}`
     : "Output will have no audio.";
-  if (trimOnly() && plan.outTracks) {
+  if (copiesVideo() && plan.outTracks) {
     audioText += encodedTracks === 0
       ? ". Audio is copied without re-encoding."
       : `. ${encodedTracks} track${encodedTracks === 1 ? " is" : "s are"} converted to AAC` +
@@ -919,6 +955,15 @@ function bindConfigInputs(): void {
   });
   $<HTMLSelectElement>("cfg-preset").addEventListener("change", (e) => { cfg.preset = (e.target as HTMLSelectElement).value; });
   $<HTMLSelectElement>("cfg-res").addEventListener("change", (e) => { cfg.resolution = (e.target as HTMLSelectElement).value; });
+  $<HTMLSelectElement>("cfg-fps").addEventListener("change", (e) => {
+    cfg.fps = (e.target as HTMLSelectElement).value;
+    updateConfigUI();
+    if (cfg.fps === "custom") $("cfg-fps-custom").focus();
+  });
+  $<HTMLInputElement>("cfg-fps-custom").addEventListener("input", (e) => {
+    cfg.customFps = parseFloat((e.target as HTMLInputElement).value) || 0;
+    updateConfigUI();
+  });
   $<HTMLInputElement>("cfg-twopass").addEventListener("change", (e) => { cfg.twoPass = (e.target as HTMLInputElement).checked; });
   $<HTMLSelectElement>("cfg-abitrate").addEventListener("change", (e) => {
     cfg.audioBitrate = Number((e.target as HTMLSelectElement).value); updateConfigUI();
@@ -964,6 +1009,10 @@ async function startExport(): Promise<void> {
   if (!media.hasVideo && plan.outTracks === 0) return err("Nothing to export — select at least one audio track.");
   const { kbps, ok } = computeVideoKbps();
   if (media.hasVideo && !ok) return err(cfg.mode === "size" ? "Target size is too small." : "Enter a video bitrate.");
+  if (media.hasVideo && cfg.fps === "custom") {
+    const fpsErr = customFpsError(cfg.customFps, media.fps);
+    if (fpsErr) return err(fpsErr);
+  }
 
   if (overwriteConfirmedFor !== output && await invoke<boolean>("path_exists", { path: output })) {
     overwriteConfirmedFor = output;
@@ -976,20 +1025,24 @@ async function startExport(): Promise<void> {
     start: inPt,
     end: outPt,
     ffmpegDir: settings.ffmpegDir,
-    video: !media.hasVideo ? null : trimOnly() ? {
+    video: !media.hasVideo ? null : copiesVideo() ? {
       encoder: "copy",
       preset: "",
       bitrateKbps: 0,
       twoPass: false,
       scaleHeight: null,
+      targetFps: null,
+      sourceFps: media.fps,
       sizeMode: false,
       sourceCodec: media.videoCodec,
     } : {
       encoder: cfg.encoder,
       preset: cfg.preset,
       bitrateKbps: kbps,
-      twoPass: cfg.twoPass,
-      scaleHeight: cfg.resolution === "orig" ? null : Number(cfg.resolution),
+      twoPass: cfg.twoPass && !trimOnly(),
+      scaleHeight: trimOnly() || cfg.resolution === "orig" ? null : Number(cfg.resolution),
+      targetFps: targetFps(),
+      sourceFps: media.fps,
       sizeMode: cfg.mode === "size",
     },
     audio: {
@@ -1297,7 +1350,7 @@ async function saveSettings(): Promise<void> {
   // Apply new defaults to the current export (keep the user's edited filename & track roles).
   const keepName = cfg.nameEdited ? { filename: cfg.filename, nameKey: cfg.nameKey, nameEdited: true } : {};
   const keepMaster = cfg.masterNameEdited ? { masterName: cfg.masterName, masterNameEdited: true } : {};
-  cfg = { ...freshConfig(), resolution: cfg.resolution, outputDir: cfg.outputDir, ...keepName, ...keepMaster };
+  cfg = { ...freshConfig(), resolution: cfg.resolution, fps: cfg.fps, customFps: cfg.customFps, outputDir: cfg.outputDir, ...keepName, ...keepMaster };
   // New default track names apply to tracks whose name the user hasn't changed.
   for (const t of media?.audio ?? []) {
     const oldDefault = previous.trackNames[t.index]?.trim() || t.title || "";

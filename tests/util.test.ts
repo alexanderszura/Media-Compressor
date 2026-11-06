@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
-  applyTemplate, bitrateForTargetSize, canCopyAudio, estimateSizeMB, formatCutVar, formatTime, joinPath, median,
+  applyTemplate, bitrateForTargetSize, canCopyAudio, customFpsError, estimateSizeMB, formatCutVar, formatFps, formatTime,
+  fpsChoices, joinPath, median,
   outputExt, parseRate, parseTime, planPreview, splitPath, templateVars,
 } from "../src/util";
 
@@ -14,6 +15,29 @@ describe("time", () => {
     expect(parseTime("12.5")).toBe(12.5);
     expect(parseTime("abc")).toBeNaN();
     expect(parseRate("30000/1001")).toBeCloseTo(29.97, 2);
+  });
+});
+
+describe("frame rate choices", () => {
+  it("only offers rates below the recorded one", () => {
+    expect(fpsChoices(60)).toEqual([50, 48, 30, 25, 24, 20, 15, 10]);
+    expect(fpsChoices(30)).toEqual([25, 24, 20, 15, 10]);
+    expect(fpsChoices(59.94)).toEqual([50, 48, 30, 25, 24, 20, 15, 10]);
+    expect(fpsChoices(30.01)).toEqual([25, 24, 20, 15, 10]);
+    expect(fpsChoices(10)).toEqual([]);
+  });
+
+  it("only accepts custom rates below the recorded one", () => {
+    expect(formatFps(30000 / 1001)).toBe(29.97);
+    expect(customFpsError(40, 60)).toBe("");
+    expect(customFpsError(29.97, 30)).toBe("");
+    expect(customFpsError(1, 60)).toBe("");
+    expect(customFpsError(60, 60)).toContain("below the recorded 60 fps");
+    expect(customFpsError(90, 60)).not.toBe("");
+    expect(customFpsError(59.94, 60000 / 1001)).not.toBe("");
+    expect(customFpsError(0.5, 60)).not.toBe("");
+    expect(customFpsError(0, 60)).not.toBe("");
+    expect(customFpsError(NaN, 60)).not.toBe("");
   });
 });
 

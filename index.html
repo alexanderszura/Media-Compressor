@@ -147,7 +147,7 @@
               <button data-mode="size">Target file size</button>
               <button data-mode="copy" title="Cut the clip without compressing or re-encoding the video">Trim only</button>
             </div>
-            <div class="grid2" id="f-encode">
+            <div class="grid2">
               <label class="field" id="f-bitrate">
                 <span>Video bitrate</span>
                 <div class="suffix"><input id="cfg-bitrate" type="number" min="100" step="100" /><em>kbps</em></div>
@@ -156,11 +156,19 @@
                 <span>Target size</span>
                 <div class="suffix"><input id="cfg-size" type="number" min="1" step="1" /><em>MB</em></div>
               </label>
-              <label class="field">
+              <label class="field" id="f-res">
                 <span>Resolution</span>
                 <select id="cfg-res"></select>
               </label>
               <label class="field">
+                <span>Frame rate</span>
+                <select id="cfg-fps"></select>
+              </label>
+              <label class="field" id="f-fps-custom" hidden>
+                <span>Custom frame rate</span>
+                <div class="suffix"><input id="cfg-fps-custom" type="number" min="1" step="any" /><em>fps</em></div>
+              </label>
+              <label class="field" id="f-encoder">
                 <span>Encoder</span>
                 <select id="cfg-encoder">
                   <option value="libx264">H.264 (x264, CPU)</option>

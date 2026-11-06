@@ -16,6 +16,11 @@ pub struct VideoOptions {
     pub two_pass: bool,
     /// Scale output to this height (keeping aspect). None = original.
     pub scale_height: Option<u32>,
+    /// Resample to this frame rate. None = keep the source's. Ignored unless it is
+    /// below `source_fps`: exports can lower the frame rate but never raise it.
+    pub target_fps: Option<f64>,
+    /// Frame rate of the input, as reported by ffprobe.
+    pub source_fps: f64,
     /// True when the bitrate came from a target file size (tighter rate control).
     #[serde(default)]
     pub size_mode: bool,
@@ -194,6 +199,20 @@ fn video_codec_args(v: &VideoOptions, pass: Option<u8>, out_ext: &str) -> Vec<St
     a
 }
 
+/// Most source frames blended into one output frame (tmix buffers them all in memory).
+const MAX_BLEND_FRAMES: u32 = 32;
+
+/// Filters that resample to the target frame rate, or None when it stays unchanged.
+/// `tmix` averages the source frames covered by each output frame, so a whole-number
+/// drop such as 60 -> 30 still blends instead of just discarding every other frame.
+/// `framerate` then blends neighbours onto the new timing for ratios like 30 -> 24.
+fn resample_filter(v: &VideoOptions) -> Option<String> {
+    let target = v.target_fps.filter(|f| !v.is_copy() && *f > 0.0 && *f < v.source_fps)?;
+    let blend = ((v.source_fps / target).round() as u32).min(MAX_BLEND_FRAMES);
+    let framerate = format!("framerate=fps={target}");
+    Some(if blend > 1 { format!("tmix=frames={blend},{framerate}") } else { framerate })
+}
+
 /// Build the argument list for one ffmpeg run.
 /// `pass` = Some(1) / Some(2) for two-pass encoding, None for single pass.
 pub fn build_args(
@@ -237,12 +256,19 @@ pub fn build_args(
     let mut audio_titles: Vec<String> = Vec::new();
 
     if let Some(v) = video {
-        match v.scale_height.filter(|_| !v.is_copy()) {
-            Some(h) => {
-                filters.push(format!("[0:v:0]scale=-2:{h}[vout]"));
-                maps.push("[vout]".into());
-            }
-            None => maps.push("0:v:0".into()),
+        // Scale first: blending the smaller frames is much cheaper.
+        let chain: Vec<String> = v
+            .scale_height
+            .filter(|_| !v.is_copy())
+            .map(|h| format!("scale=-2:{h}"))
+            .into_iter()
+            .chain(resample_filter(v))
+            .collect();
+        if chain.is_empty() {
+            maps.push("0:v:0".into());
+        } else {
+            filters.push(format!("[0:v:0]{}[vout]", chain.join(",")));
+            maps.push("[vout]".into());
         }
     }
 
@@ -423,6 +449,8 @@ mod tests {
             bitrate_kbps: 2500,
             two_pass: two,
             scale_height: None,
+            target_fps: None,
+            source_fps: 60.0,
             size_mode: false,
             source_codec: None,
         }
@@ -537,7 +565,8 @@ mod tests {
         let audio_kbps = 128.0 * 2.0;
         let video_kbps = (1.0 * 1048576.0 * 8.0 * 0.97 / 1000.0 / dur - audio_kbps) as u32;
         let vo = VideoOptions { encoder: "libx264".into(), preset: "veryfast".into(),
-            bitrate_kbps: video_kbps, two_pass: true, scale_height: Some(480), size_mode: true, source_codec: None };
+            bitrate_kbps: video_kbps, two_pass: true, scale_height: Some(480),
+            target_fps: None, source_fps: 30.0, size_mode: true, source_codec: None };
         for p in 1..=2u8 {
             let args = build_args(input, output, 2.0, 10.0, Some(&vo), &au, Some(p));
             let o = Command::new("ffmpeg").args(&args).current_dir(&dir).output().unwrap();
@@ -601,12 +630,13 @@ mod tests {
             copy: vec![true, true] };
         let mut vo = v("copy", true);
         vo.scale_height = Some(720);
+        vo.target_fps = Some(30.0);
         vo.source_codec = Some("hevc".into());
         assert_eq!(pass_count(Some(&vo)), 1);
         let s = joined(&build_args("in.mkv", "out.mp4", 3.0, 9.0, Some(&vo), &au, None));
         assert!(s.contains("-map 0:v:0 -map [amaster] -map 0:a:1"), "{s}");
         assert!(s.contains("-c:v copy -tag:v hvc1"), "{s}");
-        assert!(!s.contains("scale=") && !s.contains("-pix_fmt"), "{s}");
+        assert!(!s.contains("scale=") && !s.contains("framerate=") && !s.contains("-pix_fmt"), "{s}");
         // A mixed master has to be encoded even when copying was requested.
         assert!(s.contains("-c:a:0 aac -b:a:0 160k -c:a:1 copy"), "{s}");
         assert!(s.contains("-avoid_negative_ts make_zero"), "{s}");
@@ -643,6 +673,42 @@ mod tests {
         assert!(d > 4.9 && d < 6.3, "{d}");
     }
 
+    /// Trim-only with a lower frame rate re-encodes video and audio, and the cut stays
+    /// frame-accurate with both streams starting together.
+    #[test]
+    fn real_trim_only_with_lower_fps() {
+        use std::process::Command;
+        if Command::new("ffmpeg").arg("-version").output().is_err() {
+            return;
+        }
+        let dir = std::env::temp_dir().join("mc-trim-fps");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let src = dir.join("s.mkv");
+        assert!(Command::new("ffmpeg").args(["-v", "error", "-y", "-f", "lavfi", "-i", "testsrc2=size=640x360:rate=60:duration=8",
+            "-f", "lavfi", "-i", "sine=f=300:d=8", "-c:v", "libx264", "-g", "120", "-c:a", "ac3"]).arg(&src).status().unwrap().success());
+        let out = dir.join("o.mkv");
+        let au = AudioOptions { master: vec![0], separate: vec![], bitrate_kbps: 128, titles: vec![], copy: vec![] };
+        let mut vo = v("libx264", false);
+        vo.target_fps = Some(30.0);
+        let args = build_args(src.to_str().unwrap(), out.to_str().unwrap(), 2.5, 6.5, Some(&vo), &au, None);
+        let o = Command::new("ffmpeg").args(&args).output().unwrap();
+        assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+        let p = Command::new("ffprobe").args(["-v", "error", "-show_entries", "stream=codec_name,r_frame_rate,start_time:format=duration", "-of", "csv=p=0"])
+            .arg(&out).output().unwrap();
+        let text = String::from_utf8_lossy(&p.stdout).into_owned();
+        eprintln!("{text}");
+        let lines: Vec<&str> = text.lines().map(str::trim).filter(|l| !l.is_empty()).collect();
+        assert!(lines[0].starts_with("h264,30/1,") && lines[1].starts_with("aac,"), "{text}");
+        // Unlike a pure copy the cut is frame-accurate, despite the 2 s keyframe interval.
+        let d: f64 = lines[2].parse().unwrap();
+        assert!((d - 4.0).abs() < 0.15, "{d}");
+        for l in &lines[..2] {
+            let start: f64 = l.rsplit(',').next().unwrap().parse().unwrap();
+            assert!(start.abs() < 0.1, "{l}");
+        }
+    }
+
     #[test]
     fn scaling_goes_through_filter_complex() {
         let au = AudioOptions { master: vec![0], separate: vec![], bitrate_kbps: 128, titles: vec![], copy: vec![] };
@@ -650,5 +716,84 @@ mod tests {
         vo.scale_height = Some(720);
         let s = joined(&build_args("i.mp4", "o.mp4", 0.0, 1.0, Some(&vo), &au, None));
         assert!(s.contains("-filter_complex [0:v:0]scale=-2:720[vout] -map [vout] -map 0:a:0"));
+    }
+
+    #[test]
+    fn resample_filter_chain() {
+        let at = |source: f64, target: f64| {
+            let mut vo = v("libx264", false);
+            vo.source_fps = source;
+            vo.target_fps = Some(target);
+            resample_filter(&vo)
+        };
+        assert_eq!(at(60.0, 30.0).unwrap(), "tmix=frames=2,framerate=fps=30");
+        assert_eq!(at(60.0, 24.0).unwrap(), "tmix=frames=3,framerate=fps=24");
+        assert_eq!(at(30.0, 24.0).unwrap(), "framerate=fps=24");
+        assert_eq!(at(30.0, 29.97).unwrap(), "framerate=fps=29.97");
+        assert_eq!(at(1000.0, 10.0).unwrap(), "tmix=frames=32,framerate=fps=10");
+        assert_eq!(at(60.0, 60.0), None);
+        assert_eq!(at(30.0, 60.0), None, "the frame rate can never be raised");
+        assert_eq!(resample_filter(&v("libx264", false)), None);
+    }
+
+    #[test]
+    fn resampling_runs_after_scaling_in_both_passes() {
+        let au = AudioOptions { master: vec![0], separate: vec![], bitrate_kbps: 128, titles: vec![], copy: vec![] };
+        let mut vo = v("libx264", true);
+        vo.scale_height = Some(720);
+        vo.target_fps = Some(30.0);
+        for p in 1..=2 {
+            let s = joined(&build_args("i.mp4", "o.mp4", 0.0, 1.0, Some(&vo), &au, Some(p)));
+            assert!(s.contains("[0:v:0]scale=-2:720,tmix=frames=2,framerate=fps=30[vout] -map [vout]"), "{s}");
+        }
+    }
+
+    /// Alternating black/white frames at 60 fps: resampling to 30 has to give mid-grey,
+    /// where dropping frames would leave pure black or white. Checks the timing too.
+    #[test]
+    fn real_resample_blends_frames() {
+        use std::process::Command;
+        if Command::new("ffmpeg").arg("-version").output().is_err() {
+            return;
+        }
+        let dir = std::env::temp_dir().join("mc-resample");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let src = dir.join("s.mkv");
+        assert!(Command::new("ffmpeg").args(["-v", "error", "-y",
+            "-f", "lavfi", "-i", "color=c=black:s=64x64:r=60:d=4,format=gray,geq=lum='if(mod(N,2),235,16)',format=yuv420p",
+            "-f", "lavfi", "-i", "sine=d=4", "-c:v", "libx264", "-crf", "0", "-preset", "ultrafast", "-c:a", "aac"])
+            .arg(&src).status().unwrap().success());
+        let au = AudioOptions { master: vec![0], separate: vec![], bitrate_kbps: 128, titles: vec![], copy: vec![] };
+        for (target, passes) in [(30.0, 2u8), (24.0, 1), (25.0, 1), (40.0, 1), (29.97, 1)] {
+            let out = dir.join(format!("o{target}.mp4"));
+            let mut vo = v("libx264", passes == 2);
+            vo.bitrate_kbps = 4000;
+            vo.target_fps = Some(target);
+            for p in 1..=passes {
+                let pass = (passes == 2).then_some(p);
+                let args = build_args(src.to_str().unwrap(), out.to_str().unwrap(), 0.5, 3.5, Some(&vo), &au, pass);
+                let o = Command::new("ffmpeg").args(&args).current_dir(&dir).output().unwrap();
+                assert!(o.status.success(), "{target}: {}", String::from_utf8_lossy(&o.stderr));
+            }
+            let p = Command::new("ffprobe").args(["-v", "error", "-select_streams", "v:0", "-count_frames",
+                "-show_entries", "stream=r_frame_rate,nb_read_frames", "-of", "csv=p=0"]).arg(&out).output().unwrap();
+            let info = String::from_utf8_lossy(&p.stdout).trim().to_string();
+            eprintln!("{target} fps -> {info}");
+            let (rate, count) = info.split_once(',').unwrap();
+            let (num, den) = rate.split_once('/').unwrap();
+            let rate = num.parse::<f64>().unwrap() / den.parse::<f64>().unwrap();
+            assert!((rate - target).abs() < 0.001, "{target}: {rate}");
+            let frames: f64 = count.trim_end_matches(',').parse().unwrap();
+            assert!((frames - 3.0 * target).abs() <= 2.0, "{target}: {frames} frames");
+
+            let raw = Command::new("ffmpeg").args(["-v", "error", "-i"]).arg(&out)
+                .args(["-f", "rawvideo", "-pix_fmt", "gray", "-"]).output().unwrap().stdout;
+            let means: Vec<f64> = raw.chunks_exact(64 * 64)
+                .map(|f| f.iter().map(|&b| b as f64).sum::<f64>() / f.len() as f64).collect();
+            let mid = &means[3..means.len() - 3];
+            eprintln!("{target} fps luma {:.0?}", &mid[..6.min(mid.len())]);
+            assert!(mid.iter().all(|m| (60.0..190.0).contains(m)), "{target}: unblended frames {mid:?}");
+        }
     }
 }

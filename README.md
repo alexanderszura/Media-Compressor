@@ -34,7 +34,7 @@ cargo test -- --ignored real_install   # actually downloads FFmpeg (~190 MB)
 3. Press **Next** (or **Enter**) to open the export settings.
 4. **Configure the export:**
    - **File name.** Filled in from the format set in Settings. You can edit it, and **Reset** rebuilds it from the format.
-   - **Video.** Choose **Bitrate** (kbps) or **Target file size** (MB). In target-size mode the video bitrate is calculated for you after subtracting the audio. You can also set the encoder (x264, x265, NVENC), the speed preset, the resolution, and two-pass encoding.
+   - **Video.** Choose **Bitrate** (kbps) or **Target file size** (MB). In target-size mode the video bitrate is calculated for you after subtracting the audio. You can also set the encoder (x264, x265, NVENC), the speed preset, the resolution, the frame rate, and two-pass encoding. The frame rate can only go below the recorded rate, either from the list or by choosing **Custom…** and typing a value. When you lower it, frames are resampled by blending them, not just dropped, so motion stays smooth. **Trim only** cuts without re-encoding, but lowering the frame rate there means the video has to be re-encoded at about the source bitrate, and the audio with it.
    - **Audio tracks.** Each track can be set to one of three options:
      - **Master**: all Master tracks are mixed into a single track.
      - **Keep**: the track is kept as its own separate track.

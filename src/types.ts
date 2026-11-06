@@ -105,6 +105,9 @@ export interface ExportRequest {
     bitrateKbps: number;
     twoPass: boolean;
     scaleHeight: number | null;
+    /** Resample to this rate. null = keep the source's. Only ever below sourceFps. */
+    targetFps: number | null;
+    sourceFps: number;
     sizeMode: boolean;
     sourceCodec?: string | null;
   } | null;
